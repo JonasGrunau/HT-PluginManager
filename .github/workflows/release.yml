@@ -1,0 +1,152 @@
+# Builds the macOS DMG and the Windows installer and publishes them as a GitHub release.
+#
+#   git tag v1.2.0 && git push origin v1.2.0
+#
+# A tag with a suffix (v1.2.0-beta.1) becomes a pre-release. Running the workflow
+# by hand (Actions > Release > Run workflow) builds everything and keeps the files
+# as workflow artifacts, without creating a release.
+#
+# Secrets (the same four as the plugin repos; set them with the audio-plugin
+# skill's set-signing-secrets.sh): MACOS_CERTIFICATES_P12, MACOS_CERTIFICATES_PASSWORD,
+# NOTARY_APPLE_ID, NOTARY_PASSWORD. Without them the DMG is signed ad hoc and not notarized.
+# Variable: HURENTOHN_GITHUB_CLIENT_ID, the OAuth app's client ID for the device sign-in.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+  HURENTOHN_GITHUB_CLIENT_ID: ${{ vars.HURENTOHN_GITHUB_CLIENT_ID }}
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - id: v
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then v=${GITHUB_REF_NAME#v}; else v=0.0.0-dev.${GITHUB_SHA::7}; fi
+          if [[ ! "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME is not vMAJOR.MINOR.PATCH[-suffix]"; exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+  macos:
+    needs: version
+    runs-on: macos-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      # Signing and notarization run when the certificate secret is set.
+      SIGN: ${{ secrets.MACOS_CERTIFICATES_P12 != '' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # The app shows its version (sub-line, bundle): it comes from Cargo.toml.
+      - name: Set version
+        run: perl -0pi -e 's/^version = ".*?"/version = "$ENV{VERSION}"/m' Cargo.toml
+
+      - name: Test
+        run: cargo test --release
+
+      - name: Import Developer ID certificate
+        if: env.SIGN == 'true'
+        env:
+          P12: ${{ secrets.MACOS_CERTIFICATES_P12 }}
+          P12_PASSWORD: ${{ secrets.MACOS_CERTIFICATES_PASSWORD }}
+        run: |
+          kc="$RUNNER_TEMP/signing.keychain-db"
+          kcpass=$(uuidgen)
+          base64 --decode <<<"$P12" > "$RUNNER_TEMP/certs.p12"
+          security create-keychain -p "$kcpass" "$kc"
+          security set-keychain-settings -lut 21600 "$kc"
+          security unlock-keychain -p "$kcpass" "$kc"
+          security import "$RUNNER_TEMP/certs.p12" -k "$kc" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$kcpass" "$kc" > /dev/null
+          security list-keychains -d user | xargs security list-keychains -d user -s "$kc"
+          rm "$RUNNER_TEMP/certs.p12"
+
+          app=$(security find-identity -v -p codesigning "$kc" | sed -n 's/.*"\(Developer ID Application: .*\)"/\1/p' | head -1)
+          if [[ -z "$app" ]]; then
+            echo "::error::The .p12 has no Developer ID Application identity"; exit 1
+          fi
+          team=${app##*(}
+          { echo "HURENTOHN_SIGN_IDENTITY=$app"; echo "TEAM_ID=${team%)}"; } >> "$GITHUB_ENV"
+
+      - name: Build, sign and package
+        env:
+          NOTARY_APPLE_ID: ${{ secrets.NOTARY_APPLE_ID }}
+          NOTARY_PASSWORD: ${{ secrets.NOTARY_PASSWORD }}
+          HURENTOHN_OUT: dist
+        run: |
+          if [[ "$SIGN" == true ]]; then
+            scripts/bundle.sh --universal --dmg --notarize
+          else
+            echo "::warning::MACOS_CERTIFICATES_P12 is not set, so the DMG is signed ad hoc and not notarized"
+            HURENTOHN_SIGN_IDENTITY=- scripts/bundle.sh --universal --dmg
+          fi
+          rm -rf "dist/HurenTohn Plugin Manager.app"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos
+          path: dist/*.dmg
+          if-no-files-found: error
+
+  windows:
+    needs: version
+    runs-on: windows-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set version
+        shell: bash
+        run: perl -0pi -e 's/^version = ".*?"/version = "$ENV{VERSION}"/m' Cargo.toml
+
+      - name: Test
+        run: cargo test --release
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Package
+        run: |
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$env:VERSION" "/DExe=$PWD\target\release\hurentohn.exe" "/O$PWD\dist" packaging\windows\HurenTohn.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows
+          path: dist/*.exe
+          if-no-files-found: error
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: [version, macos, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          flags=()
+          [[ "$VERSION" == *-* ]] && flags+=(--prerelease)
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
+            --verify-tag --title "HurenTohn Plugin Manager $VERSION" --generate-notes "${flags[@]}"

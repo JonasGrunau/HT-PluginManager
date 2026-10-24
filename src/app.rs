@@ -22,8 +22,12 @@ const ROW_H: f32 = 200.0;
 const IMG_W: f32 = 240.0;
 const IMG_H: f32 = 160.0;
 const ACTION_W: f32 = 196.0;
+/// Depth of the shadows at the top and bottom of a scrolled list.
+const SHADOW_H: f32 = 40.0;
 /// How long the offline screen waits before it tries the stored login again by itself.
 const RETRY: Duration = Duration::from_secs(30);
+/// How long COPY CODE reads COPIED after a click.
+const COPIED_FOR: Duration = Duration::from_secs(2);
 /// What a worker reports when it panicked, so nothing waits on it forever.
 const CRASHED: &str = "HurenTohn hit an internal error. Try again.";
 
@@ -318,6 +322,8 @@ pub struct App {
     running: HashSet<String>,
     /// When the offline screen tries the stored login again.
     retry_at: Option<Instant>,
+    /// When the device code was last copied by hand.
+    copied_at: Option<Instant>,
     /// The rows with an update waiting, worked out once per frame.
     waiting: Vec<usize>,
     /// What the hovered control does, collected while drawing; the footer shows it.
@@ -350,6 +356,7 @@ impl App {
             generation: 0,
             running: HashSet::new(),
             retry_at: None,
+            copied_at: None,
             waiting: Vec::new(),
             help: None,
             notice: cfg_error,
@@ -361,12 +368,22 @@ impl App {
             }),
         };
         app.check_helper();
-        // HURENTOHN_SNAPSHOT_STATE=signed-out renders the sign-in page without touching the stored login.
-        let signed_out_shot = app.snapshot.is_some() && std::env::var("HURENTOHN_SNAPSHOT_STATE").is_ok_and(|s| s == "signed-out");
-        if signed_out_shot {
-            app.auth = Auth::SignedOut { device: None, busy: false, error: None };
-        } else {
-            app.validate_stored();
+        // HURENTOHN_SNAPSHOT_STATE=signed-out renders the sign-in page without touching the stored login,
+        // =device the page with a (made-up) device code.
+        let shot_state = std::env::var("HURENTOHN_SNAPSHOT_STATE").ok().filter(|_| app.snapshot.is_some());
+        match shot_state.as_deref() {
+            Some("signed-out") => app.auth = Auth::SignedOut { device: None, busy: false, error: None },
+            Some("device") => {
+                let device = DeviceCode {
+                    device_code: String::new(),
+                    user_code: "WDJB-MJHT".into(),
+                    verification_uri: "https://github.com/login/device".into(),
+                    expires_in: 899,
+                    interval: 5,
+                };
+                app.auth = Auth::SignedOut { device: Some(device), busy: false, error: None };
+            }
+            _ => app.validate_stored(),
         }
         app
     }
@@ -649,6 +666,27 @@ impl App {
         });
     }
 
+    fn start_uninstall(&mut self, idx: usize) {
+        let p = &mut self.plugins[idx];
+        if self.running.contains(&p.repo.full_name) {
+            return;
+        }
+        let Some(manifest) = p.manifest.as_ref() else { return };
+        let bundles = manifest.bundles.clone();
+        let full = p.repo.full_name.clone();
+        let name = p.name().to_string();
+        p.job = Job::Working {
+            title: "UNINSTALLING".into(),
+            frac: None,
+            detail: format!("{} from {}", bundles.join(", "), platform::SYSTEM_DIR_LABEL),
+        };
+        self.spawn_job(full, bundles.clone(), move |_| {
+            privileged::uninstall_bundles(&bundles, &name).map_err(|message| (message, None))?;
+            privileged::refresh_audio_units();
+            Ok(format!("{name} is uninstalled."))
+        });
+    }
+
     fn start_build(&mut self, idx: usize) {
         let Some(gh) = self.gh() else { return };
         let juce = self.cfg.juce();
@@ -799,6 +837,10 @@ impl App {
                     if let Job::Done(text) = &job {
                         self.notice = Some(text.clone());
                     }
+                    // A record of how a plug-in got installed outlives no uninstall.
+                    if installed.system.is_empty() && self.installs.0.remove(&full).is_some() {
+                        self.installs.save();
+                    }
                     if let Some(p) = self.plugin(&full) {
                         p.installed = installed;
                         p.job = if matches!(job, Job::Done(_)) { Job::Idle } else { job };
@@ -940,8 +982,10 @@ impl App {
         let ctx = ui.ctx().clone();
         let rect = ui.max_rect();
         let painter = ui.painter().clone();
+        // Window chrome doesn't scale with the sheet: sizes here are window points.
+        let pt = 1.0 / ctx.zoom_factor();
         painter.rect_filled(rect, egui::CornerRadius::ZERO, col::WELL);
-        painter.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, col::HAIRLINE));
+        painter.hline(rect.x_range(), rect.bottom() - 0.5 * pt, Stroke::new(pt, col::HAIRLINE));
         // No title text: the masthead right under it already says what this is.
         // macOS puts its traffic lights on the left of this bar; Windows gets our keys on the right.
 
@@ -957,12 +1001,12 @@ impl App {
         if cfg!(target_os = "macos") {
             return;
         }
-        let size = vec2(26.0, 18.0);
+        let size = vec2(26.0, 18.0) * pt;
         let mut x = x0 + sheet::RIGHT;
         for glyph in [theme::WindowGlyph::Close, theme::WindowGlyph::Zoom, theme::WindowGlyph::Minimize] {
             let r = Rect::from_min_size(pos2(x - size.x, rect.center().y - size.y / 2.0), size);
-            x = r.left() - sheet::XS;
-            let resp = theme::window_key(ui, r, glyph);
+            x = r.left() - sheet::XS * pt;
+            let resp = theme::window_key(ui, r, glyph, pt);
             if resp.hovered() {
                 self.help = Some(
                     match glyph {
@@ -1019,7 +1063,13 @@ impl App {
         let error = error.map(|e| centred(&e, theme::font(Face::Text, size::BODY), col::INK, 3));
 
         // Heights first, so the block can be centred as a whole.
-        let action_h = if device.is_some() { 72.0 + sheet::MD + 14.0 + sheet::LG + 30.0 } else { 30.0 };
+        let action_h = if device.is_some() {
+            72.0 + sheet::MD + 14.0 + sheet::LG + 30.0
+        } else if has_client {
+            30.0 + sheet::SM + 30.0
+        } else {
+            30.0
+        };
         let mut total = heading.size().y + sheet::MD + body.size().y + sheet::XL + action_h;
         if let Some(g) = &error {
             total += sheet::LG + g.size().y;
@@ -1049,9 +1099,16 @@ impl App {
         };
 
         if let Some(code) = device {
+            // The code copies on a click, on the well or on COPY CODE: the copy
+            // made when it arrived is gone once something else is copied.
             let well = Rect::from_min_size(pos2(cx - 160.0, y), vec2(320.0, 72.0));
+            let well_r = ui.interact(well, ui.id().with("device_code"), Sense::click());
+            if well_r.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            let edge = if well_r.hovered() { col::INK_FAINT } else { col::HAIRLINE };
             painter.rect_filled(well, theme::radius(), col::WELL);
-            painter.rect_stroke(well, theme::radius(), Stroke::new(1.0, col::HAIRLINE), egui::StrokeKind::Inside);
+            painter.rect_stroke(well, theme::radius(), Stroke::new(1.0, edge), egui::StrokeKind::Inside);
             theme::text(
                 &painter,
                 well.center(),
@@ -1066,19 +1123,32 @@ impl App {
                 &painter,
                 pos2(cx, y),
                 Align2::CENTER_TOP,
-                "Enter this code on the GitHub page that just opened. It is on your clipboard.",
+                "Paste this code on the GitHub page that just opened. It is already on your clipboard.",
                 size::CONTROL,
                 col::INK_SOFT,
             );
             y += 14.0 + sheet::LG;
+            let copied = self.copied_at.is_some_and(|t| t.elapsed() < COPIED_FOR);
+            let copy_label = if copied { "COPIED" } else { "COPY CODE" };
             let keys = row(
-                &[("OPEN GITHUB AGAIN", theme::key_width(&painter, "OPEN GITHUB AGAIN")), ("CANCEL", theme::key_width(&painter, "CANCEL"))],
+                &[
+                    (copy_label, theme::key_width(&painter, "COPY CODE")),
+                    ("OPEN GITHUB AGAIN", theme::key_width(&painter, "OPEN GITHUB AGAIN")),
+                    ("CANCEL", theme::key_width(&painter, "CANCEL")),
+                ],
                 y,
             );
-            if theme::key(ui, keys[0], "OPEN GITHUB AGAIN", KeyKind::Outline, true).clicked() {
+            if theme::key(ui, keys[0], copy_label, KeyKind::Outline, true).clicked() || well_r.clicked() {
+                ui.ctx().copy_text(code.user_code.clone());
+                self.copied_at = Some(Instant::now());
+            }
+            if let Some(t) = self.copied_at.filter(|t| t.elapsed() < COPIED_FOR) {
+                ui.ctx().request_repaint_after(COPIED_FOR.saturating_sub(t.elapsed()));
+            }
+            if theme::key(ui, keys[1], "OPEN GITHUB AGAIN", KeyKind::Outline, true).clicked() {
                 open_url(&code.verification_uri);
             }
-            if theme::key(ui, keys[1], "CANCEL", KeyKind::Quiet, true).clicked() {
+            if theme::key(ui, keys[2], "CANCEL", KeyKind::Quiet, true).clicked() {
                 self.device_cancel.store(true, Ordering::Relaxed);
                 self.auth = Auth::SignedOut { device: None, busy: false, error: None };
             }
@@ -1086,10 +1156,13 @@ impl App {
             return;
         }
 
+        // The keys stack, one width: GitHub on top, the gh CLI under it.
         let label = if busy { "SIGNING IN" } else { "SIGN IN WITH GITHUB" };
-        let cli_w = theme::key_width(&painter, "USE GH CLI LOGIN").max(if has_client { 0.0 } else { 220.0 });
-        let keys = if has_client { row(&[(label, 220.0), ("USE GH CLI LOGIN", cli_w)], y) } else { row(&[("USE GH CLI LOGIN", cli_w)], y) };
+        let key_w = theme::key_width(&painter, "SIGN IN WITH GITHUB").max(theme::key_width(&painter, "USE GH CLI LOGIN")).max(220.0);
+        let mut keys = vec![Rect::from_min_size(pos2(cx - key_w / 2.0, y), vec2(key_w, 30.0))];
         if has_client {
+            keys.push(keys[0].translate(vec2(0.0, 30.0 + sheet::SM)));
+            y += 30.0 + sheet::SM;
             let r = theme::key(ui, keys[0], label, KeyKind::Lit, !busy);
             if r.hovered() {
                 self.help = Some("Opens GitHub in your browser with a one-time code; no password goes through this app.".into());
@@ -1098,7 +1171,7 @@ impl App {
                 self.start_device_login();
             }
         }
-        let cli_kind = if has_client { KeyKind::Outline } else { KeyKind::Lit };
+        let cli_kind = if has_client { KeyKind::Secondary } else { KeyKind::Lit };
         let r = theme::key(ui, *keys.last().unwrap(), "USE GH CLI LOGIN", cli_kind, !busy);
         if r.hovered() {
             self.help = Some("Takes the token of your `gh auth login` session and keeps a copy on this computer.".into());
@@ -1160,7 +1233,7 @@ impl App {
             self.centered_sentence(&mut list_ui, x0, &sentence, false);
             return;
         }
-        egui::ScrollArea::vertical().auto_shrink(false).show(&mut list_ui, |ui| {
+        let scroll = egui::ScrollArea::vertical().auto_shrink(false).show(&mut list_ui, |ui| {
             for i in 0..self.plugins.len() {
                 let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::hover());
                 if ui.is_rect_visible(rect) {
@@ -1171,6 +1244,16 @@ impl App {
                 }
             }
         });
+        // The legend above and the footer below cast a shadow onto rows that
+        // slide under them, so the list reads as going on, not cut off. Each
+        // fades in over the first SHADOW_H of hidden list.
+        let view = scroll.inner_rect;
+        let above = scroll.state.offset.y;
+        let below = scroll.content_size.y - above - view.height();
+        // As wide as the rows, not the window.
+        let band = |top: f32| Rect::from_min_max(pos2(left, top), pos2(x0 + sheet::RIGHT, top + SHADOW_H));
+        theme::edge_shadow(&painter, band(view.top()), true, above / SHADOW_H);
+        theme::edge_shadow(&painter, band(view.bottom() - SHADOW_H), false, below / SHADOW_H);
     }
 
     fn plugin_row(&mut self, ui: &mut Ui, idx: usize, rect: Rect, x0: f32) {
@@ -1344,7 +1427,7 @@ impl App {
         }
 
         let keys_y = y0 + IMG_H - 26.0 - sheet::SM - 30.0;
-        let primary = Rect::from_min_size(pos2(ax, keys_y), vec2(ACTION_W, 30.0));
+        let mut primary = Rect::from_min_size(pos2(ax, keys_y), vec2(ACTION_W, 30.0));
         let secondary = Rect::from_min_size(pos2(ax, keys_y + 30.0 + sheet::SM), vec2(ACTION_W, 26.0));
         if let Job::Working { title, frac, detail } = p.job.clone() {
             let time = ui.input(|i| i.time);
@@ -1373,14 +1456,26 @@ impl App {
 
         let name = p.name().to_string();
         let can_install = p.release.as_ref().and_then(|r| r.installer()).is_some();
-        let (label, kind) = match (status, &p.release) {
-            (Status::Update, Some(r)) => (format!("UPDATE TO {}", r.version()), KeyKind::Lit),
-            (Status::NotInstalled, Some(r)) => (format!("INSTALL {}", r.version()), KeyKind::Outline),
-            (Status::UpToDate, Some(r)) => (format!("REINSTALL {}", r.version()), KeyKind::Quiet),
-            (Status::Ahead | Status::MainBuild, Some(r)) => (format!("INSTALL RELEASE {}", r.version()), KeyKind::Quiet),
-            (Status::Unknown, _) => ("RELEASE UNKNOWN".into(), KeyKind::Quiet),
-            _ => ("NO RELEASE".into(), KeyKind::Quiet),
+        // The label without its version, for when UNINSTALL shares the line.
+        let (mut label, short, kind) = match (status, &p.release) {
+            (Status::Update, Some(r)) => (format!("UPDATE TO {}", r.version()), "UPDATE", KeyKind::Lit),
+            (Status::NotInstalled, Some(r)) => (format!("INSTALL {}", r.version()), "INSTALL", KeyKind::Outline),
+            (Status::UpToDate, Some(r)) => (format!("REINSTALL {}", r.version()), "REINSTALL", KeyKind::Quiet),
+            (Status::Ahead | Status::MainBuild, Some(r)) => (format!("INSTALL RELEASE {}", r.version()), "INSTALL RELEASE", KeyKind::Quiet),
+            (Status::Unknown, _) => ("RELEASE UNKNOWN".into(), "RELEASE UNKNOWN", KeyKind::Quiet),
+            _ => ("NO RELEASE".into(), "NO RELEASE", KeyKind::Quiet),
         };
+        // Installed: UNINSTALL sits right of the main key, which drops its
+        // version (it is in the rows above) if the two don't fit side by side.
+        let uninstall = (!p.installed.system.is_empty()).then(|| {
+            let w = theme::key_width(&painter, "UNINSTALL");
+            let r = Rect::from_min_size(pos2(ax + ACTION_W - w, keys_y), vec2(w, 30.0));
+            primary.max.x = r.left() - sheet::SM;
+            if theme::key_width(&painter, &label) > primary.width() {
+                label = short.into();
+            }
+            r
+        });
         let enabled = can_install && status != Status::Loading;
         let resp = theme::key(ui, primary, &label, kind, enabled);
         if resp.hovered() {
@@ -1397,6 +1492,20 @@ impl App {
         }
         if resp.clicked() {
             self.start_install(idx);
+        }
+        if let Some(r) = uninstall {
+            let resp = theme::key(ui, r, "UNINSTALL", KeyKind::Quiet, status != Status::Loading);
+            if resp.hovered() {
+                let p = &self.plugins[idx];
+                let mut help = format!("Removes {name} from {}; {}.", platform::SYSTEM_DIR_LABEL, platform::UNINSTALL_HOW);
+                if p.installed.user_version().is_some() {
+                    help.push_str(&format!(" The local build in {} stays.", platform::USER_DIR_LABEL));
+                }
+                self.help = Some(help);
+            }
+            if resp.clicked() {
+                self.start_uninstall(idx);
+            }
         }
         let resp = theme::key(ui, secondary, "BUILD FROM MAIN", KeyKind::Secondary, status != Status::Loading);
         if resp.hovered() {
@@ -1567,17 +1676,16 @@ impl eframe::App for App {
             }
         }
         self.fit_sheet(&ctx);
+        // The title bar is window chrome: TITLE_H window points whatever the zoom.
+        let title_h = sheet::TITLE_H / ctx.zoom_factor();
         #[cfg(target_os = "macos")]
-        {
-            let zoom = ctx.zoom_factor() as f64;
-            platform::place_traffic_lights(frame, sheet::TITLE_H as f64 * zoom, zoom);
-        }
+        platform::place_traffic_lights(frame, sheet::TITLE_H as f64, 1.0);
         #[cfg(not(target_os = "macos"))]
         let _ = frame;
         self.help = None;
 
         let x0_of = |ui: &Ui| ui.max_rect().left() + ((ui.max_rect().width() - sheet::W) / 2.0).max(0.0);
-        egui::Panel::top("title-bar").exact_size(sheet::TITLE_H).frame(egui::Frame::NONE.fill(col::WELL)).show_separator_line(false).show(
+        egui::Panel::top("title-bar").exact_size(title_h).frame(egui::Frame::NONE.fill(col::WELL)).show_separator_line(false).show(
             ui,
             |ui| {
                 let x0 = x0_of(ui);
@@ -1618,7 +1726,7 @@ impl eframe::App for App {
         if matches!(self.auth, Auth::SignedIn { .. } | Auth::Offline(_)) {
             self.footer(&top, footer, x0);
         }
-        theme::crop_marks(&top, Rect::from_min_max(pos2(screen.left(), screen.top() + sheet::TITLE_H), screen.max));
+        theme::crop_marks(&top, Rect::from_min_max(pos2(screen.left(), screen.top() + title_h), screen.max));
         // Windows: the window's own border, since there is no system frame.
         // macOS keeps its native frame (rounded corners, shadow, resizing).
         #[cfg(windows)]

@@ -62,8 +62,9 @@ pub mod sheet {
     pub const RIGHT: f32 = 856.0;
     pub const CONTENT_W: f32 = RIGHT - LEFT;
     /// The app's own title bar above the sheet.
-    /// The app's own title bar. On macOS the traffic lights sit centred on it
-    /// with 10.5 pt above and below, a little more than their 9 pt left inset.
+    /// The app's own title bar, in window points: unlike the sheet it doesn't
+    /// zoom. On macOS the traffic lights sit centred on it with 10.5 pt above
+    /// and below, a little more than their 9 pt left inset.
     pub const TITLE_H: f32 = 36.0;
     pub const MAST_H: f32 = 76.0;
     pub const MAST_RULE_Y: f32 = 74.0;
@@ -236,6 +237,31 @@ pub fn section_tag(painter: &Painter, left_top: Pos2, letter: &str, name: &str) 
     boxr.union(name_r)
 }
 
+/// The shadow the sheet casts onto a list scrolled under it: darkest on the
+/// edge at `top` (or the bottom edge), eased out to nothing across `rect`.
+/// `strength` 0..1 lets it fade in with how much of the list is hidden there.
+pub fn edge_shadow(painter: &Painter, rect: Rect, from_top: bool, strength: f32) {
+    const DARKEST: f32 = 55.0;
+    const STEPS: usize = 12;
+    if strength <= 0.0 {
+        return;
+    }
+    let mut mesh = egui::Mesh::default();
+    for i in 0..=STEPS {
+        let t = i as f32 / STEPS as f32;
+        let y = if from_top { rect.top() + t * rect.height() } else { rect.bottom() - t * rect.height() };
+        let shade = Color32::from_black_alpha((DARKEST * strength.min(1.0) * (1.0 - t).powi(2)) as u8);
+        mesh.colored_vertex(pos2(rect.left(), y), shade);
+        mesh.colored_vertex(pos2(rect.right(), y), shade);
+        if i > 0 {
+            let n = mesh.vertices.len() as u32;
+            mesh.add_triangle(n - 4, n - 3, n - 2);
+            mesh.add_triangle(n - 3, n - 2, n - 1);
+        }
+    }
+    painter.add(mesh);
+}
+
 /// Diagonal hatching inside `rect`: what is missing or blocked.
 pub fn hatch(painter: &Painter, rect: Rect, color: Color32) {
     let p = painter.with_clip_rect(rect.intersect(painter.clip_rect()));
@@ -327,8 +353,9 @@ pub enum WindowGlyph {
 }
 
 /// A title-bar key: a hairline glyph at rest, a raised well under the
-/// pointer; close fills with ink, like every key that acts at once.
-pub fn window_key(ui: &mut Ui, rect: Rect, glyph: WindowGlyph) -> Response {
+/// pointer; close fills with ink, like every key that acts at once. `pt` is
+/// one window point, so the glyph keeps its size whatever the zoom.
+pub fn window_key(ui: &mut Ui, rect: Rect, glyph: WindowGlyph, pt: f32) -> Response {
     let resp = ui.allocate_rect(rect, Sense::click());
     let hot = resp.hovered();
     let painter = ui.painter();
@@ -341,8 +368,8 @@ pub fn window_key(ui: &mut Ui, rect: Rect, glyph: WindowGlyph) -> Response {
         painter.rect_filled(rect, radius(), fill);
     }
     let c = rect.center();
-    let s = Stroke::new(1.2, ink);
-    let h = 4.0;
+    let s = Stroke::new(1.2 * pt, ink);
+    let h = 4.0 * pt;
     match glyph {
         WindowGlyph::Minimize => {
             painter.line_segment([c + vec2(-h, 0.0), c + vec2(h, 0.0)], s);

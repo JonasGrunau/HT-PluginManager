@@ -224,6 +224,20 @@ pub fn install_bundles(bundles: &[PathBuf], product: &str) -> Result<(), String>
     run_as_admin(&steps.join(" && "), &format!("HurenTohn Plugin Manager wants to install your build of {product}."))
 }
 
+/// Removes the plug-in's bundles from /Library/Audio/Plug-Ins. Always through
+/// the password prompt: the helper can only install, and an uninstall is rare
+/// enough to ask. The user's own plug-in folder is left alone.
+pub fn uninstall_bundles(bundles: &[String], product: &str) -> Result<(), String> {
+    let copies = super::installed_copies(bundles);
+    super::check_bundles(&copies)?;
+    if copies.is_empty() {
+        return Ok(());
+    }
+    let _lock = INSTALL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let steps: Vec<String> = copies.iter().map(|c| format!("rm -rf -- {}", sh_quote(&c.to_string_lossy()))).collect();
+    run_as_admin(&steps.join(" && "), &format!("HurenTohn Plugin Manager wants to uninstall {product}."))
+}
+
 /// Makes hosts see a new Audio Unit without a reboot.
 pub fn refresh_audio_units() {
     let _ = Command::new("/usr/bin/killall").args(["-9", "AudioComponentRegistrar"]).output();

@@ -9,7 +9,7 @@
 # Secrets (the same four as the plugin repos; set them with the audio-plugin
 # skill's set-signing-secrets.sh): MACOS_CERTIFICATES_P12, MACOS_CERTIFICATES_PASSWORD,
 # NOTARY_APPLE_ID, NOTARY_PASSWORD. Without them the DMG is signed ad hoc and not notarized.
-# Variable: HURENTOHN_GITHUB_CLIENT_ID, the OAuth app's client ID for the device sign-in.
+# Optional variable: HURENTOHN_GITHUB_CLIENT_ID overrides the OAuth client ID built into src/config.rs.
 name: Release
 
 on:

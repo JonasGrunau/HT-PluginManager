@@ -12,7 +12,7 @@
 # Notary credentials: NOTARY_APPLE_ID + NOTARY_PASSWORD + TEAM_ID when set (CI);
 # otherwise the notarytool keychain profile "hurentohn-notary", created on the
 # first --notarize from 1Password (the items the plugin release pipelines read).
-# The GitHub OAuth client ID is baked in from HURENTOHN_GITHUB_CLIENT_ID if set.
+# HURENTOHN_GITHUB_CLIENT_ID, if set, overrides the OAuth client ID built into src/config.rs.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

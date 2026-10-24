@@ -28,6 +28,12 @@ pub enum HelperState {
 /// Installers refuse to run twice at once; neither do we.
 static INSTALL_LOCK: Mutex<()> = Mutex::new(());
 
+/// Where each of `bundles` sits in the system plugin folders, for the ones
+/// that are there: what an uninstall removes.
+fn installed_copies(bundles: &[String]) -> Vec<std::path::PathBuf> {
+    bundles.iter().filter_map(|b| crate::platform::system_dir(b).map(|d| d.join(b))).filter(|p| p.is_dir()).collect()
+}
+
 /// The last guard before anything is deleted or copied as admin: every
 /// bundle must end in a plain bundle file name, or the destination joined
 /// from it could be the plugin folder itself.

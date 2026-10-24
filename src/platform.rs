@@ -50,6 +50,7 @@ mod imp {
     pub const INSTALLER_SUFFIX: &str = "-macOS.pkg";
     pub const INSTALL_HOW: &str = "installs it into /Library/Audio/Plug-Ins, no installer windows";
     pub const INSTALL_DETAIL: &str = "installer -pkg, no windows";
+    pub const UNINSTALL_HOW: &str = "macOS asks for your password first";
 
     pub fn support_dir() -> PathBuf {
         home().join("Library/Application Support/HurenTohn")
@@ -92,6 +93,7 @@ mod imp {
     pub const INSTALLER_SUFFIX: &str = "-Windows-Setup.exe";
     pub const INSTALL_HOW: &str = "runs its installer silently (Windows asks once for admin rights)";
     pub const INSTALL_DETAIL: &str = "Setup.exe /VERYSILENT";
+    pub const UNINSTALL_HOW: &str = "Windows asks for admin rights first";
 
     fn env_dir(var: &str) -> PathBuf {
         std::env::var_os(var).map(PathBuf::from).unwrap_or_else(home)

@@ -5,12 +5,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// Client ID of the GitHub OAuth app that signs in through the device flow.
-/// Client IDs are public; the app needs no secret for the device flow.
-/// `config.json` can override it.
+/// Client ID of the GitHub OAuth app that signs in through the device flow
+/// ("HurenTohn Plugin Manager", device flow on). Client IDs are public; the app
+/// needs no secret for the device flow. `HURENTOHN_GITHUB_CLIENT_ID` at build
+/// time or `config.json` can override it.
 pub const GITHUB_CLIENT_ID: &str = match option_env!("HURENTOHN_GITHUB_CLIENT_ID") {
     Some(id) => id,
-    None => "",
+    None => "Ov23lioYTJ0fxEWmPnXo",
 };
 
 pub const DEFAULT_WHITELIST: [&str; 5] =

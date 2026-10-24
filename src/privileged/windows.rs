@@ -44,6 +44,32 @@ pub fn install_bundles(bundles: &[PathBuf], product: &str) -> Result<(), String>
         .map_err(|e| format!("Installing your build of {product} failed: {e}"))
 }
 
+/// Removes the plug-in from Common Files\VST3. A release install keeps its
+/// Inno Setup uninstaller inside the bundle (`{app}` is the bundle), so that
+/// runs first and takes the Apps & Features entry with it; whatever is left,
+/// such as a build of main, is deleted.
+pub fn uninstall_bundles(bundles: &[String], product: &str) -> Result<(), String> {
+    let copies = super::installed_copies(bundles);
+    super::check_bundles(&copies)?;
+    if copies.is_empty() {
+        return Ok(());
+    }
+    let _lock = INSTALL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut script = String::from("$ErrorActionPreference = 'Stop'\r\n");
+    for c in &copies {
+        script.push_str(&format!(
+            "$b = {}\r\n$u = Join-Path $b 'unins000.exe'\r\nif (Test-Path -LiteralPath $u) {{\r\n  Start-Process -FilePath $u -ArgumentList '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART' -Wait\r\n  for ($i = 0; $i -lt 60 -and (Test-Path -LiteralPath $b); $i++) {{ Start-Sleep -Milliseconds 500 }}\r\n}}\r\nif (Test-Path -LiteralPath $b) {{ Remove-Item -LiteralPath $b -Recurse -Force }}\r\n",
+            ps_quote(&c.to_string_lossy()),
+        ));
+    }
+    let dir = crate::config::support_dir().join("install");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join("uninstall.ps1");
+    std::fs::write(&path, script).map_err(|e| e.to_string())?;
+    run_elevated("powershell.exe", &["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", &path.to_string_lossy()])
+        .map_err(|e| format!("Uninstalling {product} failed: {e}"))
+}
+
 /// Audio Units don't exist on Windows.
 pub fn refresh_audio_units() {}
 

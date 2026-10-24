@@ -16,6 +16,16 @@ pub fn is_au(bundle: &str) -> bool {
     bundle.ends_with(".component")
 }
 
+/// Starts `cmd` and waits for it on a short-lived thread, so a finished
+/// `open` doesn't linger as a zombie process until HurenTohn quits.
+fn spawn_detached(mut cmd: Command) {
+    if let Ok(mut child) = cmd.spawn() {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
+}
+
 /// A Command that never flashes a console window on Windows.
 pub fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     #[allow(unused_mut)]
@@ -66,7 +76,9 @@ mod imp {
     }
 
     pub fn open_url(url: &str) {
-        let _ = Command::new("/usr/bin/open").arg(url).spawn();
+        let mut cmd = Command::new("/usr/bin/open");
+        cmd.arg(url);
+        spawn_detached(cmd);
     }
 }
 
@@ -112,7 +124,9 @@ mod imp {
 
     /// Explorer hands URLs to the default browser and files to their app.
     pub fn open_url(url: &str) {
-        let _ = Command::new("explorer.exe").arg(url).spawn();
+        let mut cmd = Command::new("explorer.exe");
+        cmd.arg(url);
+        spawn_detached(cmd);
     }
 }
 

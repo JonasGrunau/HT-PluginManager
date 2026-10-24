@@ -39,7 +39,25 @@ impl Manifest {
     pub fn parse(bytes: &[u8], repo_name: &str) -> Result<Self, String> {
         let mut m: Manifest = serde_json::from_slice(bytes).map_err(|e| format!("{FILE} is not valid: {e}"))?;
         m.fill_defaults(repo_name);
+        m.check()?;
         Ok(m)
+    }
+
+    /// Names that end up in install commands must be plain: every bundle a
+    /// bare `.vst3`/`.component` file name, the artefacts folder inside the
+    /// build dir.
+    pub fn check(&self) -> Result<(), String> {
+        if let Some(bad) = self.bundles.iter().find(|b| !crate::installed::valid_bundle_name(b)) {
+            return Err(format!("{FILE}: bundle {bad:?} is not a plain .vst3 or .component file name."));
+        }
+        if self.bundles.is_empty() {
+            return Err(format!("{FILE} names no bundles."));
+        }
+        let inside = std::path::Path::new(&self.build.artefacts).components().all(|c| matches!(c, std::path::Component::Normal(_)));
+        if !inside {
+            return Err(format!("{FILE}: artefacts {:?} must be a folder inside the build dir.", self.build.artefacts));
+        }
+        Ok(())
     }
 
     /// No manifest: take the README's title, first paragraph and first image.
@@ -80,6 +98,15 @@ impl Manifest {
             m.description = strip_markdown(&paragraph.join(" "));
         }
         m.fill_defaults(repo_name);
+        // A README title like "A/B Tester" makes no usable bundle name; the
+        // repo name always does.
+        if m.check().is_err() {
+            let name = std::mem::take(&mut m.name);
+            m.bundles.clear();
+            m.build = Build::default();
+            m.fill_defaults(repo_name);
+            m.name = name;
+        }
         m
     }
 
@@ -161,6 +188,23 @@ mod tests {
         assert_eq!(m("BuildApp"), ("BUILD".into(), "APP".into()));
         assert_eq!(m("DisTitten"), ("DIS".into(), "TITTEN".into()));
         assert_eq!(m("plain"), ("PLAIN".into(), String::new()));
+    }
+
+    #[test]
+    fn manifest_rejects_paths_in_names() {
+        assert!(Manifest::parse(br#"{"bundles":[".."]}"#, "X").is_err());
+        assert!(Manifest::parse(br#"{"bundles":["../../evil.vst3"]}"#, "X").is_err());
+        assert!(Manifest::parse(br#"{"build":{"artefacts":"../../etc"}}"#, "X").is_err());
+        assert!(Manifest::parse(br#"{"build":{"artefacts":"/etc"}}"#, "X").is_err());
+        assert!(Manifest::parse(br#"{"bundles":["X.vst3"]}"#, "X").is_ok());
+    }
+
+    #[test]
+    fn readme_titles_that_are_no_file_names_fall_back_to_the_repo() {
+        let m = Manifest::from_readme("# A/B Tester\n\nCompares two things.\n", "ABTester");
+        assert_eq!(m.name, "A/B Tester");
+        assert_eq!(m.bundles, ["ABTester.vst3", "ABTester.component"]);
+        assert_eq!(m.build.artefacts, "ABTester_artefacts/Release");
     }
 
     #[test]

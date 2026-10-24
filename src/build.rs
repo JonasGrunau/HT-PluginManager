@@ -7,8 +7,26 @@ use base64::Engine;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, MutexGuard, TryLockError};
 
 const BUILD_DIR: &str = "build-hurentohn";
+
+/// One build at a time: each one uses every core, and JUCE builds take a
+/// gigabyte or two of memory apiece.
+static BUILD_LOCK: Mutex<()> = Mutex::new(());
+
+/// Waits for the build before this one to finish. `waiting` runs once, only
+/// if there is a build to wait for.
+pub fn wait_turn(waiting: impl FnOnce()) -> MutexGuard<'static, ()> {
+    match BUILD_LOCK.try_lock() {
+        Ok(turn) => turn,
+        Err(TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(TryLockError::WouldBlock) => {
+            waiting();
+            BUILD_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        }
+    }
+}
 
 pub enum Step {
     Fetching,
@@ -26,6 +44,9 @@ pub enum Step {
 pub struct Built {
     pub bundles: Vec<PathBuf>,
     pub log: PathBuf,
+    /// The commit that was built. The one asked for, unless GitHub refused
+    /// to fetch it by sha and the branch had moved on.
+    pub sha: String,
 }
 
 pub struct BuildError {
@@ -55,9 +76,23 @@ pub fn build_main(
     let fail = |message: String| BuildError { message, log: log.clone() };
     let _ = std::fs::create_dir_all(crate::config::log_dir());
     let mut log_file = std::fs::File::create(&log).map_err(|e| fail(format!("Can't write the build log: {e}")))?;
+    manifest.check().map_err(&fail)?;
 
     let src = source_dir(full_name);
     step(Step::Fetching);
+    if src.join(".git").is_dir() {
+        // Builds run one at a time, so a lock file here is left over from one
+        // that was killed; git would refuse to touch the checkout forever.
+        for lock in ["index.lock", "shallow.lock"] {
+            let _ = std::fs::remove_file(src.join(".git").join(lock));
+        }
+        // A checkout whose git config no longer reads (an interrupted first
+        // fetch, a damaged disk) is started over.
+        if git(token, &src, &["remote", "get-url", "origin"], &mut log_file).is_err() {
+            let _ = writeln!(log_file, "# the checkout is damaged; starting it over");
+            let _ = std::fs::remove_dir_all(&src);
+        }
+    }
     if !src.join(".git").is_dir() {
         let _ = std::fs::remove_dir_all(&src);
         std::fs::create_dir_all(&src).map_err(|e| fail(e.to_string()))?;
@@ -70,6 +105,7 @@ pub fn build_main(
         .or_else(|_| git(token, &src, &["fetch", "-q", "--depth", "1", "origin", branch], &mut log_file))
         .map_err(&fail)?;
     git(token, &src, &["checkout", "-q", "--force", "FETCH_HEAD"], &mut log_file).map_err(&fail)?;
+    let built_sha = head_sha(&src).unwrap_or_else(|| sha.to_string());
     // Keeps ignored files, so the build dir and its downloaded JUCE survive.
     git(token, &src, &["clean", "-q", "-fd"], &mut log_file).map_err(&fail)?;
     if src.join(".gitmodules").is_file() {
@@ -110,6 +146,7 @@ pub fn build_main(
     .map_err(&fail)?;
 
     let artefacts = src.join(BUILD_DIR).join(&manifest.build.artefacts);
+    // `check` made sure every name is a bare bundle file name.
     let mut bundles = Vec::new();
     for name in manifest.bundles.iter().filter(|b| cfg!(target_os = "macos") || !platform::is_au(b)) {
         let sub = if name.ends_with(".component") { "AU" } else { "VST3" };
@@ -119,7 +156,18 @@ pub fn build_main(
         }
         bundles.push(path);
     }
-    Ok(Built { bundles, log })
+    if bundles.is_empty() {
+        return Err(fail(format!("{} names no bundle this computer can install.", crate::manifest::FILE)));
+    }
+    Ok(Built { bundles, log, sha: built_sha })
+}
+
+/// The commit the checkout is at.
+fn head_sha(dir: &Path) -> Option<String> {
+    let out =
+        platform::command("git").args(["rev-parse", "HEAD"]).current_dir(dir).env("PATH", crate::config::tool_path()).output().ok()?;
+    let sha = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    (out.status.success() && !sha.is_empty()).then_some(sha)
 }
 
 /// Git with the token as an HTTP header passed through the environment: it
@@ -130,6 +178,9 @@ fn git(token: &str, dir: &Path, args: &[&str], log: &mut std::fs::File) -> Resul
     cmd.args(args)
         .current_dir(dir)
         .env("GIT_TERMINAL_PROMPT", "0")
+        // A stalled connection fails after a minute instead of hanging the row.
+        .env("GIT_HTTP_LOW_SPEED_LIMIT", "1000")
+        .env("GIT_HTTP_LOW_SPEED_TIME", "60")
         .env("GIT_CONFIG_COUNT", "1")
         .env("GIT_CONFIG_KEY_0", "http.https://github.com/.extraheader")
         .env("GIT_CONFIG_VALUE_0", format!("AUTHORIZATION: basic {basic}"));
@@ -153,12 +204,16 @@ fn run_streamed(mut cmd: Command, log: &mut std::fs::File, mut on_line: impl FnM
     // The Command still holds the write end; drop it so the read ends at exit.
     drop(cmd);
     let mut last = String::new();
-    for line in BufReader::new(reader).lines() {
-        let line = line.unwrap_or_default();
+    // By bytes, not `lines()`: a compiler quoting a file in another encoding
+    // must not turn its lines into blanks.
+    for line in BufReader::new(reader).split(b'\n') {
+        let Ok(bytes) = line else { break };
+        let line = String::from_utf8_lossy(&bytes);
+        let line = line.trim_end_matches('\r');
         let _ = writeln!(log, "{line}");
-        on_line(&line);
+        on_line(line);
         if !line.trim().is_empty() {
-            last = line;
+            last = line.to_string();
         }
     }
     let status = child.wait().map_err(|e| e.to_string())?;
@@ -219,6 +274,29 @@ mod tests {
         for b in &built.bundles {
             assert!(b.join("Contents/Info.plist").is_file(), "{}", b.display());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn streamed_lines_survive_other_encodings() {
+        let mut log = tempfile_log();
+        let mut lines = Vec::new();
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", r"printf 'caf\351\nnext\n'"]);
+        run_streamed(cmd, &mut log, |l| lines.push(l.to_string())).unwrap();
+        assert_eq!(lines, ["caf\u{FFFD}", "next"]);
+    }
+
+    #[test]
+    fn builds_wait_their_turn() {
+        let first = wait_turn(|| panic!("nothing to wait for"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let second = std::thread::spawn(move || {
+            let _turn = wait_turn(|| tx.send(()).unwrap());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5)).expect("the second build waits");
+        drop(first);
+        second.join().unwrap();
     }
 
     #[cfg(unix)]

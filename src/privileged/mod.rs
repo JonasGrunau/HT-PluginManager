@@ -27,3 +27,14 @@ pub enum HelperState {
 
 /// Installers refuse to run twice at once; neither do we.
 static INSTALL_LOCK: Mutex<()> = Mutex::new(());
+
+/// The last guard before anything is deleted or copied as admin: every
+/// bundle must end in a plain bundle file name, or the destination joined
+/// from it could be the plugin folder itself.
+fn check_bundles(bundles: &[std::path::PathBuf]) -> Result<(), String> {
+    let plain = |b: &std::path::PathBuf| b.file_name().and_then(|n| n.to_str()).is_some_and(crate::installed::valid_bundle_name);
+    match bundles.iter().find(|b| !plain(b)) {
+        Some(bad) => Err(format!("Refusing to install {}: not a plain .vst3 or .component bundle.", bad.display())),
+        None => Ok(()),
+    }
+}

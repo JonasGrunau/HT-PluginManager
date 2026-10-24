@@ -22,6 +22,7 @@ pub fn install_release(setup: &Path, product: &str) -> Result<(), String> {
 
 /// Copies locally built VST3 bundles into Common Files\VST3.
 pub fn install_bundles(bundles: &[PathBuf], product: &str) -> Result<(), String> {
+    super::check_bundles(bundles)?;
     let _lock = INSTALL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut script = String::from("$ErrorActionPreference = 'Stop'\r\n");
     for b in bundles {

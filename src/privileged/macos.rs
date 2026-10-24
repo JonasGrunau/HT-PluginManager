@@ -110,6 +110,29 @@ pub fn run_as_admin(command: &str, prompt: &str) -> Result<(), String> {
     }
 }
 
+/// `printf` of `content` into `dest`, for a root shell: the bytes come from
+/// this process's memory, never from a file the user could swap meanwhile.
+fn write_file_command(content: &str, dest: &str) -> String {
+    format!("printf '%s' {} > {dest}", sh_quote(content))
+}
+
+/// The one root command `install_helper` runs: both files written into a
+/// root-only temp dir, the sudoers rule checked with `visudo -c`, then both
+/// installed.
+fn helper_install_command(user: &str) -> String {
+    [
+        "d=$(mktemp -d /private/var/tmp/hurentohn-setup.XXXXXX)".to_string(),
+        r#"trap 'rm -rf "$d"' EXIT"#.to_string(),
+        write_file_command(&helper_script(), r#""$d/helper""#),
+        write_file_command(&format!("{user} ALL=(root) NOPASSWD: {HELPER}\n"), r#""$d/sudoers""#),
+        r#"/usr/sbin/visudo -cf "$d/sudoers""#.to_string(),
+        "install -d -o root -g wheel -m 755 /Library/PrivilegedHelperTools".to_string(),
+        format!(r#"install -o root -g wheel -m 755 "$d/helper" {HELPER}"#),
+        format!(r#"install -o root -g wheel -m 440 "$d/sudoers" {SUDOERS}"#),
+    ]
+    .join(" && ")
+}
+
 /// One password prompt: writes the helper and the sudoers rule (checked with
 /// `visudo -c` before it goes live).
 pub fn install_helper() -> Result<(), String> {
@@ -117,28 +140,10 @@ pub fn install_helper() -> Result<(), String> {
     if !user.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)) {
         return Err(format!("Unusual user name {user:?}; set up the helper by hand."));
     }
-    let staging = crate::config::support_dir().join("helper-staging");
-    let _ = std::fs::remove_dir_all(&staging);
-    std::fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
-    let helper = staging.join("helper");
-    let sudoers = staging.join("sudoers");
-    std::fs::write(&helper, helper_script()).map_err(|e| e.to_string())?;
-    std::fs::write(&sudoers, format!("{user} ALL=(root) NOPASSWD: {HELPER}\n")).map_err(|e| e.to_string())?;
-
-    let (h, s) = (helper.to_string_lossy(), sudoers.to_string_lossy());
-    let command = [
-        "install -d -o root -g wheel -m 755 /Library/PrivilegedHelperTools".to_string(),
-        format!("install -o root -g wheel -m 755 {} {HELPER}", sh_quote(&h)),
-        format!("/usr/sbin/visudo -cf {}", sh_quote(&s)),
-        format!("install -o root -g wheel -m 440 {} {SUDOERS}", sh_quote(&s)),
-    ]
-    .join(" && ");
-    let result = run_as_admin(
-        &command,
+    run_as_admin(
+        &helper_install_command(&user),
         "HurenTohn Plugin Manager wants to install plugin updates without asking every time. This is the only time it asks.",
-    );
-    let _ = std::fs::remove_dir_all(&staging);
-    result?;
+    )?;
     match helper_state() {
         HelperState::Ready => Ok(()),
         _ => Err("The helper is in place, but sudo still wants a password for it.".into()),
@@ -149,8 +154,25 @@ fn sudo_helper(args: &[&str]) -> Result<std::process::Output, String> {
     Command::new("/usr/bin/sudo").arg("-n").arg(HELPER).args(args).output().map_err(|e| format!("Can't run the install helper: {e}"))
 }
 
+/// sudo itself said no (the rule went away since `helper_state` looked):
+/// the helper never ran, so the password prompt can still do the job.
+fn sudo_refused(out: &std::process::Output) -> bool {
+    !out.status.success() && String::from_utf8_lossy(&out.stderr).trim_start().starts_with("sudo:")
+}
+
+/// What the helper checks, asked as the user: is this pkg notarized and
+/// signed by our Developer ID team?
+fn signed_by_us(pkg: &Path) -> bool {
+    let Ok(out) = Command::new("/usr/sbin/spctl").args(["--assess", "--type", "install", "-vv"]).arg(pkg).output() else {
+        return false;
+    };
+    let text = String::from_utf8_lossy(&out.stderr).into_owned() + &String::from_utf8_lossy(&out.stdout);
+    out.status.success() && text.lines().any(|l| l.starts_with("origin=Developer ID Installer: ") && l.ends_with(&format!("({TEAM_ID})")))
+}
+
 /// Installs a release pkg headless. Silent through the helper when the pkg is
-/// signed by our team; otherwise one password prompt.
+/// signed by our team; otherwise one password prompt, which says so when
+/// the signature is not ours.
 pub fn install_release(pkg: &Path, product: &str) -> Result<(), String> {
     let _lock = INSTALL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let path = pkg.to_string_lossy();
@@ -159,28 +181,38 @@ pub fn install_release(pkg: &Path, product: &str) -> Result<(), String> {
         if out.status.success() {
             return Ok(());
         }
-        if out.status.code() != Some(EXIT_REJECTED) {
+        if out.status.code() != Some(EXIT_REJECTED) && !sudo_refused(&out) {
             return Err(failure("installer", &out));
         }
-        // Not signed by our team (e.g. an unsigned release): ask instead.
+        // Not signed by our team (e.g. an unsigned release), or sudo said no: ask instead.
     }
-    run_as_admin(
-        &format!("/usr/sbin/installer -pkg {} -target /", sh_quote(&path)),
-        &format!("HurenTohn Plugin Manager wants to install {product}."),
-    )
+    let prompt = if signed_by_us(pkg) {
+        format!("HurenTohn Plugin Manager wants to install {product}.")
+    } else {
+        format!("HurenTohn Plugin Manager wants to install {product}. Careful: this package is not signed by Jonas Grunau's Developer ID.")
+    };
+    run_as_admin(&format!("/usr/sbin/installer -pkg {} -target /", sh_quote(&path)), &prompt)
 }
 
 /// Copies locally built bundles into /Library/Audio/Plug-Ins.
 pub fn install_bundles(bundles: &[PathBuf], product: &str) -> Result<(), String> {
+    super::check_bundles(bundles)?;
     let _lock = INSTALL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if helper_state() == HelperState::Ready {
+        let mut refused = false;
         for b in bundles {
             let out = sudo_helper(&["bundle", &b.to_string_lossy()])?;
+            if sudo_refused(&out) {
+                refused = true;
+                break;
+            }
             if !out.status.success() {
                 return Err(failure("copy", &out));
             }
         }
-        return Ok(());
+        if !refused {
+            return Ok(());
+        }
     }
     let mut steps = Vec::new();
     for b in bundles {
@@ -197,10 +229,13 @@ pub fn refresh_audio_units() {
     let _ = Command::new("/usr/bin/killall").args(["-9", "AudioComponentRegistrar"]).output();
 }
 
+/// The tool's last word: stderr, else stdout (`installer` prints its errors there).
 fn failure(what: &str, out: &std::process::Output) -> String {
-    let err = String::from_utf8_lossy(&out.stderr);
-    let line = err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
-    if line.is_empty() { format!("{what} failed ({})", out.status) } else { format!("{what} failed: {line}") }
+    let last = |bytes: &[u8]| String::from_utf8_lossy(bytes).lines().rev().map(str::trim).find(|l| !l.is_empty()).map(str::to_string);
+    match last(&out.stderr).or_else(|| last(&out.stdout)) {
+        Some(line) => format!("{what} failed: {line}"),
+        None => format!("{what} failed ({})", out.status),
+    }
 }
 
 #[cfg(test)]
@@ -223,5 +258,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(ok);
         assert!(helper_script().contains("(JQ4STVWTQ3)$"));
+    }
+
+    /// The root shell gets the helper byte for byte from the printf, quotes,
+    /// `%` and all, so `helper_state` sees the script it expects.
+    #[test]
+    fn printf_writes_the_helper_exactly() {
+        let out = Command::new("/bin/sh").args(["-c", &write_file_command(&helper_script(), "/dev/stdout")]).output().unwrap();
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), helper_script());
+        let tricky = "it's 100%s \\n done\n";
+        let out = Command::new("/bin/sh").args(["-c", &write_file_command(tricky, "/dev/stdout")]).output().unwrap();
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), tricky);
+    }
+
+    #[test]
+    fn helper_install_reads_no_user_files() {
+        let cmd = helper_install_command("jonas");
+        assert!(!cmd.contains("Application Support"));
+        assert!(cmd.contains("visudo -cf"));
+        let ok = Command::new("/bin/sh").args(["-n", "-c", &cmd]).status().unwrap().success();
+        assert!(ok, "{cmd}");
+    }
+
+    #[test]
+    fn failures_fall_back_to_stdout() {
+        use std::os::unix::process::ExitStatusExt;
+        let out = std::process::Output {
+            status: std::process::ExitStatus::from_raw(256),
+            stdout: b"installer: Error - the package is damaged.\n".to_vec(),
+            stderr: Vec::new(),
+        };
+        assert_eq!(failure("installer", &out), "installer failed: installer: Error - the package is damaged.");
     }
 }

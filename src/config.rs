@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Client ID of the GitHub OAuth app that signs in through the device flow.
 /// Client IDs are public; the app needs no secret for the device flow.
@@ -37,6 +37,10 @@ pub struct Config {
     /// Set once the first start has offered the silent-install helper, so
     /// the password prompt comes once, not on every start.
     pub helper_offered: bool,
+    /// The file on disk didn't parse: these are the defaults, and saving
+    /// them would throw away the user's edits.
+    #[serde(skip)]
+    read_only: bool,
 }
 
 impl Default for Config {
@@ -46,6 +50,7 @@ impl Default for Config {
             whitelist: DEFAULT_WHITELIST.iter().map(|s| s.to_string()).collect(),
             juce_dir: String::new(),
             helper_offered: false,
+            read_only: false,
         }
     }
 }
@@ -56,13 +61,17 @@ impl Config {
     }
 
     /// Reads `config.json`, writing the defaults on first start so there is a
-    /// file to edit. A broken file falls back to the defaults and says why.
+    /// file to edit. A broken file falls back to the defaults, says why, and
+    /// is left alone until the user fixes it.
     pub fn load() -> (Self, Option<String>) {
         let path = Self::path();
         match std::fs::read(&path) {
             Ok(bytes) => match serde_json::from_slice(&bytes) {
                 Ok(cfg) => (cfg, None),
-                Err(e) => (Self::default(), Some(format!("{} is not valid JSON ({e}); using defaults.", path.display()))),
+                Err(e) => (
+                    Self { read_only: true, ..Self::default() },
+                    Some(format!("{} is not valid JSON ({e}); using defaults until it is fixed.", path.display())),
+                ),
             },
             Err(_) => {
                 let cfg = Self::default();
@@ -73,9 +82,11 @@ impl Config {
     }
 
     pub fn save(&self) {
-        let _ = std::fs::create_dir_all(support_dir());
+        if self.read_only {
+            return;
+        }
         if let Ok(json) = serde_json::to_vec_pretty(self) {
-            let _ = std::fs::write(Self::path(), json);
+            let _ = write_atomic(&Self::path(), &json);
         }
     }
 
@@ -114,9 +125,40 @@ impl Installs {
     }
 
     pub fn save(&self) {
-        let _ = std::fs::create_dir_all(support_dir());
         if let Ok(json) = serde_json::to_vec_pretty(self) {
-            let _ = std::fs::write(Self::path(), json);
+            let _ = write_atomic(&Self::path(), &json);
         }
+    }
+}
+
+/// Writes next to `path`, then renames over it: a crash mid-write leaves the
+/// old file, never half a JSON document.
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// `owner/repo` as GitHub allows it: one slash, letters, digits, `.`, `_`, `-`.
+pub fn is_repo_name(s: &str) -> bool {
+    let ok = |part: &str| !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c));
+    s.split_once('/').is_some_and(|(owner, repo)| ok(owner) && ok(repo))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn whitelist_entries_must_be_owner_slash_repo() {
+        assert!(is_repo_name("JonasGrunau/PsyBox"));
+        assert!(is_repo_name("a-b/c.d_e"));
+        assert!(!is_repo_name("JonasGrunau/Psy Box"));
+        assert!(!is_repo_name("JonasGrunau"));
+        assert!(!is_repo_name("a/b/c"));
+        assert!(!is_repo_name("/b"));
     }
 }

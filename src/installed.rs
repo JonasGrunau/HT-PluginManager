@@ -22,7 +22,7 @@ pub struct Installed {
 impl Installed {
     pub fn scan(bundles: &[String]) -> Self {
         let mut found = Installed::default();
-        for bundle in bundles {
+        for bundle in bundles.iter().filter(|b| valid_bundle_name(b)) {
             if let Some(c) = platform::system_dir(bundle).and_then(|d| read(&d.join(bundle))) {
                 found.system.push(c);
             }
@@ -46,6 +46,16 @@ impl Installed {
     pub fn user_version(&self) -> Option<String> {
         self.user.iter().filter_map(|c| c.version.as_deref().and_then(parse_version)).min().map(|v| v.to_string())
     }
+}
+
+/// A plain bundle file name, the same rule the macOS helper enforces:
+/// `PsyBox.vst3`, `Phase Fucker.component`. No path separators, no `..`, no
+/// leading dot, so joining it to a plugin folder can only name a bundle in it.
+pub fn valid_bundle_name(name: &str) -> bool {
+    let plain = name.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || "._ -".contains(c));
+    let stem = name.strip_suffix(".vst3").or_else(|| name.strip_suffix(".component"));
+    plain && stem.is_some_and(|s| !s.is_empty())
 }
 
 /// Lenient semver: `0.3` → `0.3.0`, `v1.2.3` → `1.2.3`.
@@ -92,6 +102,15 @@ mod tests {
         assert_eq!(parse_version("v0.3.2"), semver::Version::parse("0.3.2").ok());
         assert_eq!(parse_version("0.3"), semver::Version::parse("0.3.0").ok());
         assert_eq!(parse_version("nope"), None);
+    }
+
+    #[test]
+    fn bundle_names_are_plain_file_names() {
+        assert!(valid_bundle_name("PsyBox.vst3"));
+        assert!(valid_bundle_name("Phase Fucker.component"));
+        for bad in ["", "..", ".vst3", "../x.vst3", "a/b.vst3", r"a\b.vst3", "PsyBox", "PsyBox.dll", ".hidden.vst3", "Psy—Box.vst3"] {
+            assert!(!valid_bundle_name(bad), "{bad:?}");
+        }
     }
 
     #[test]

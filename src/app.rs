@@ -9,6 +9,8 @@ use crate::privileged::{self, HelperState};
 use crate::theme::{self, Face, KeyKind, col, sheet, size};
 use crate::{auth, build};
 use egui::{Align2, Color32, ColorImage, Pos2, Rect, Sense, Stroke, TextureHandle, Ui, pos2, vec2};
+use std::collections::HashSet;
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,6 +22,10 @@ const ROW_H: f32 = 200.0;
 const IMG_W: f32 = 240.0;
 const IMG_H: f32 = 160.0;
 const ACTION_W: f32 = 196.0;
+/// How long the offline screen waits before it tries the stored login again by itself.
+const RETRY: Duration = Duration::from_secs(30);
+/// What a worker reports when it panicked, so nothing waits on it forever.
+const CRASHED: &str = "HurenTohn hit an internal error. Try again.";
 
 // ---------------------------------------------------------------------------
 // Messages from the worker threads
@@ -27,16 +33,48 @@ const ACTION_W: f32 = 196.0;
 // A handful of messages per refresh; boxing the big ones buys nothing.
 #[allow(clippy::large_enum_variant)]
 enum Msg {
-    SignedIn { gh: Gh, login: String },
+    SignedIn {
+        gh: Gh,
+        login: String,
+    },
     SignedOut(Option<String>),
     Offline(String),
+    /// GitHub turned the login down (401) in the middle of a session.
+    Expired {
+        generation: u64,
+    },
     Device(DeviceCode),
-    Repos(Result<Vec<Repo>, String>),
-    Details { full: String, manifest: Manifest, release: Option<Release>, error: Option<String> },
-    Image { full: String, color: ColorImage, gray: ColorImage },
+    Repos {
+        generation: u64,
+        result: Result<Vec<Repo>, github::Error>,
+    },
+    Details {
+        generation: u64,
+        full: String,
+        details: Details,
+    },
+    Image {
+        full: String,
+        source: String,
+        color: ColorImage,
+        gray: ColorImage,
+    },
     ImageMissing(String),
-    Job { full: String, job: Job },
-    Record { full: String, record: InstallRecord },
+    /// Progress of a running job.
+    Job {
+        full: String,
+        job: Job,
+    },
+    /// A job ended. `installed` is what is on disk now, read on the worker.
+    Finished {
+        full: String,
+        job: Job,
+        installed: Installed,
+    },
+    Record {
+        full: String,
+        record: InstallRecord,
+    },
     Helper(HelperState, Option<String>),
 }
 
@@ -61,8 +99,37 @@ impl Sink {
     }
 }
 
-fn spawn(f: impl FnOnce() + Send + 'static) {
-    std::thread::spawn(f);
+/// Runs `f` on a worker thread. If it panics, `on_panic` still sends the
+/// message the UI is waiting for, so no row or key stays busy forever.
+fn spawn(f: impl FnOnce() + Send + 'static, on_panic: impl FnOnce() + Send + 'static) {
+    std::thread::spawn(move || {
+        if std::panic::catch_unwind(AssertUnwindSafe(f)).is_err() {
+            on_panic();
+        }
+    });
+}
+
+/// Asks GitHub whose `token` this is (on a worker thread). `save` stores it
+/// once GitHub accepts it. Only a 401 drops a stored login: a rate limit or
+/// an outage leaves it alone and shows the app offline instead.
+fn check_token(sink: &Sink, token: String, save: bool) {
+    let gh = Gh::new(token);
+    match gh.user() {
+        Ok(user) => {
+            if save && let Err(e) = auth::save_token(gh.token()) {
+                return sink.send(Msg::SignedOut(Some(e)));
+            }
+            sink.send(Msg::SignedIn { gh, login: user.login });
+        }
+        Err(github::Error::Expired) => {
+            if !save {
+                auth::forget_token();
+            }
+            sink.send(Msg::SignedOut(Some(github::Error::Expired.to_string())));
+        }
+        Err(e) if save => sink.send(Msg::SignedOut(Some(e.to_string()))),
+        Err(e) => sink.send(Msg::Offline(e.to_string())),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -75,6 +142,9 @@ enum Job {
     Failed { message: String, log: Option<PathBuf> },
     Done(String),
 }
+
+/// How a job ends: the sentence for the footer, or what broke and its log.
+type Outcome = Result<String, (String, Option<PathBuf>)>;
 
 enum Auth {
     Checking,
@@ -92,17 +162,62 @@ enum Status {
     UpToDate,
     Ahead,
     MainBuild,
+    /// The release request failed and no earlier answer is known.
+    Unknown,
 }
 
 struct Plugin {
     repo: Repo,
     manifest: Option<Manifest>,
     release: Option<Release>,
+    /// A release request got an answer ("no release" counts).
+    release_checked: bool,
     details_error: Option<String>,
     installed: Installed,
     image: Option<(TextureHandle, TextureHandle)>,
+    /// The manifest's `image` the textures were made from.
+    image_source: Option<String>,
     image_missing: bool,
     job: Job,
+}
+
+/// What a row already shows, handed to the details worker so a failed
+/// request keeps it instead of blanking the row.
+#[derive(Clone, Default)]
+struct Known {
+    manifest: Option<Manifest>,
+    /// `Some` once a release request got an answer.
+    release: Option<Option<Release>>,
+    /// The picture on screen, which isn't fetched again.
+    image: Option<String>,
+}
+
+/// What one look at a repo found. Where a request failed, the row keeps what
+/// it knew: a network blip must not turn UPDATE AVAILABLE into UP TO DATE.
+struct Details {
+    manifest: Manifest,
+    release: Option<Release>,
+    release_checked: bool,
+    installed: Installed,
+    error: Option<String>,
+}
+
+impl Details {
+    fn resolve(repo_name: &str, manifest: Result<Manifest, String>, release: Result<Option<Release>, String>, known: &Known) -> Self {
+        let mut error = None;
+        let manifest = manifest.unwrap_or_else(|e| {
+            error = Some(e);
+            known.manifest.clone().unwrap_or_else(|| Manifest::from_readme("", repo_name))
+        });
+        let (release, release_checked) = match release {
+            Ok(r) => (r, true),
+            Err(e) => {
+                error.get_or_insert(e);
+                (known.release.clone().flatten(), known.release.is_some())
+            }
+        };
+        Self { manifest, release, release_checked, installed: Installed::default(), error }
+    }
 }
 
 impl Plugin {
@@ -111,11 +226,21 @@ impl Plugin {
             repo,
             manifest: None,
             release: None,
+            release_checked: false,
             details_error: None,
             installed: Installed::default(),
             image: None,
+            image_source: None,
             image_missing: false,
             job: Job::Idle,
+        }
+    }
+
+    fn known(&self) -> Known {
+        Known {
+            manifest: self.manifest.clone(),
+            release: self.release_checked.then(|| self.release.clone()),
+            image: self.image.as_ref().and(self.image_source.clone()),
         }
     }
 
@@ -123,32 +248,29 @@ impl Plugin {
         self.manifest.as_ref().map(|m| m.name.as_str()).unwrap_or(&self.repo.name)
     }
 
-    fn rescan(&mut self) {
-        if let Some(m) = &self.manifest {
-            self.installed = Installed::scan(&m.bundles);
-        }
-    }
-
     fn busy(&self) -> bool {
         matches!(self.job, Job::Working { .. })
     }
 
     /// A build of main is recognised by the record HurenTohn wrote when it
-    /// installed it, as long as the bundle on disk still has that version.
+    /// installed it, as long as the bundle on disk still has that version
+    /// (compared as versions: the plist may say `0.3`, the scan `0.3.0`).
     fn main_build<'a>(&self, record: Option<&'a InstallRecord>) -> Option<(&'a str, &'a str)> {
         match record? {
-            InstallRecord::Main { sha, committed_at, bundle_version }
-                if Some(bundle_version.as_str()) == self.installed.version_string().as_deref() =>
-            {
-                Some((sha.as_str(), committed_at.as_str()))
+            InstallRecord::Main { sha, committed_at, bundle_version } => {
+                let recorded = installed::parse_version(bundle_version)?;
+                (Some(recorded) == self.installed.version()).then_some((sha.as_str(), committed_at.as_str()))
             }
-            _ => None,
+            InstallRecord::Release { .. } => None,
         }
     }
 
     fn status(&self, record: Option<&InstallRecord>) -> Status {
         if self.manifest.is_none() {
             return Status::Loading;
+        }
+        if !self.release_checked {
+            return Status::Unknown;
         }
         let release = self.release.as_ref().and_then(|r| installed::parse_version(r.version()));
         if let Some((_, committed_at)) = self.main_build(record) {
@@ -188,6 +310,16 @@ pub struct App {
     helper: Option<HelperState>,
     helper_busy: bool,
     device_cancel: Arc<AtomicBool>,
+    /// Bumped by every refresh and sign-out; worker results from an older
+    /// one are dropped when they arrive.
+    generation: u64,
+    /// Repos with an install or build on a worker. Survives a sign-out, so a
+    /// second job for the same repo can't start next to it.
+    running: HashSet<String>,
+    /// When the offline screen tries the stored login again.
+    retry_at: Option<Instant>,
+    /// The rows with an update waiting, worked out once per frame.
+    waiting: Vec<usize>,
     /// What the hovered control does, collected while drawing; the footer shows it.
     help: Option<String>,
     /// The last thing that happened, for the footer at rest.
@@ -215,6 +347,10 @@ impl App {
             helper: None,
             helper_busy: false,
             device_cancel: Arc::new(AtomicBool::new(false)),
+            generation: 0,
+            running: HashSet::new(),
+            retry_at: None,
+            waiting: Vec::new(),
             help: None,
             notice: cfg_error,
             snapshot: std::env::var_os("HURENTOHN_SNAPSHOT").map(|p| Snapshot {
@@ -227,9 +363,10 @@ impl App {
         app.check_helper();
         // HURENTOHN_SNAPSHOT_STATE=signed-out renders the sign-in page without touching the stored login.
         let signed_out_shot = app.snapshot.is_some() && std::env::var("HURENTOHN_SNAPSHOT_STATE").is_ok_and(|s| s == "signed-out");
-        match auth::load_token().filter(|_| !signed_out_shot) {
-            Some(token) => app.validate(token, false),
-            None => app.auth = Auth::SignedOut { device: None, busy: false, error: None },
+        if signed_out_shot {
+            app.auth = Auth::SignedOut { device: None, busy: false, error: None };
+        } else {
+            app.validate_stored();
         }
         app
     }
@@ -239,40 +376,34 @@ impl App {
 
     fn check_helper(&self) {
         let sink = self.sink.clone();
-        spawn(move || sink.send(Msg::Helper(privileged::helper_state(), None)));
+        spawn(move || sink.send(Msg::Helper(privileged::helper_state(), None)), || {});
     }
 
     fn install_helper(&mut self) {
         self.helper_busy = true;
-        let sink = self.sink.clone();
-        spawn(move || {
-            let note = privileged::install_helper().err();
-            sink.send(Msg::Helper(privileged::helper_state(), note));
-        });
+        let (sink, crash) = (self.sink.clone(), self.sink.clone());
+        spawn(
+            move || {
+                let note = privileged::install_helper().err();
+                sink.send(Msg::Helper(privileged::helper_state(), note));
+            },
+            move || crash.send(Msg::Helper(HelperState::Missing, Some(CRASHED.into()))),
+        );
     }
 
-    /// Checks a stored or new token. `save` stores it in the keychain once GitHub accepts it.
-    fn validate(&mut self, token: String, save: bool) {
-        let sink = self.sink.clone();
-        spawn(move || {
-            let gh = Gh::new(token);
-            match gh.user() {
-                Ok(user) => {
-                    if save && let Err(e) = auth::save_token(gh.token()) {
-                        sink.send(Msg::SignedOut(Some(e)));
-                        return;
-                    }
-                    sink.send(Msg::SignedIn { gh, login: user.login });
-                }
-                Err(e) if e.contains("expired") || e.contains("signed-in user") => {
-                    if !save {
-                        auth::forget_token();
-                    }
-                    sink.send(Msg::SignedOut(Some(e)));
-                }
-                Err(e) => sink.send(Msg::Offline(e)),
-            }
-        });
+    /// Signs in with the stored login. The keychain is read on the worker:
+    /// it can stall on a system prompt.
+    fn validate_stored(&mut self) {
+        self.auth = Auth::Checking;
+        self.retry_at = None;
+        let (sink, crash) = (self.sink.clone(), self.sink.clone());
+        spawn(
+            move || match auth::load_token() {
+                Some(token) => check_token(&sink, token, false),
+                None => sink.send(Msg::SignedOut(None)),
+            },
+            move || crash.send(Msg::Offline(CRASHED.into())),
+        );
     }
 
     fn start_device_login(&mut self) {
@@ -280,60 +411,82 @@ impl App {
         self.auth = Auth::SignedOut { device: None, busy: true, error: None };
         self.device_cancel = Arc::new(AtomicBool::new(false));
         let cancel = self.device_cancel.clone();
-        let sink = self.sink.clone();
-        spawn(move || {
-            let code = match github::request_device_code(&client_id) {
-                Ok(c) => c,
-                Err(e) => return sink.send(Msg::SignedOut(Some(e))),
-            };
-            sink.send(Msg::Device(code.clone()));
-            let mut interval = code.interval.max(5);
-            let deadline = Instant::now() + Duration::from_secs(code.expires_in);
-            while Instant::now() < deadline {
-                std::thread::sleep(Duration::from_secs(interval));
-                if cancel.load(Ordering::Relaxed) {
-                    return;
-                }
-                match github::poll_device_token(&client_id, &code.device_code) {
-                    Ok(github::Poll::Pending) => {}
-                    Ok(github::Poll::SlowDown) => interval += 5,
-                    Ok(github::Poll::Token(token)) => {
-                        let gh = Gh::new(token);
-                        let result = gh.user().and_then(|u| auth::save_token(gh.token()).map(|_| u));
-                        return match result {
-                            Ok(user) => sink.send(Msg::SignedIn { gh, login: user.login }),
-                            Err(e) => sink.send(Msg::SignedOut(Some(e))),
-                        };
+        let (sink, crash) = (self.sink.clone(), self.sink.clone());
+        spawn(
+            move || {
+                let code = match github::request_device_code(&client_id) {
+                    Ok(c) => c,
+                    Err(e) => return sink.send(Msg::SignedOut(Some(e.to_string()))),
+                };
+                sink.send(Msg::Device(code.clone()));
+                let mut interval = code.interval.max(5);
+                let deadline = Instant::now() + Duration::from_secs(code.expires_in);
+                while Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_secs(interval));
+                    if cancel.load(Ordering::Relaxed) {
+                        return;
                     }
-                    Err(e) => return sink.send(Msg::SignedOut(Some(e))),
+                    match github::poll_device_token(&client_id, &code.device_code) {
+                        Ok(github::Poll::Pending) => {}
+                        Ok(github::Poll::SlowDown) => interval += 5,
+                        // A dropped connection isn't a refusal: ask again until the code expires.
+                        Err(github::Error::Offline(_)) => {}
+                        Ok(github::Poll::Token(token)) => {
+                            // Cancelled while this poll was under way: the user has moved on.
+                            if cancel.load(Ordering::Relaxed) {
+                                return;
+                            }
+                            return check_token(&sink, token, true);
+                        }
+                        Err(e) => return sink.send(Msg::SignedOut(Some(e.to_string()))),
+                    }
                 }
-            }
-            sink.send(Msg::SignedOut(Some("The code expired. Start the sign-in again.".into())));
-        });
+                if !cancel.load(Ordering::Relaxed) {
+                    sink.send(Msg::SignedOut(Some("The code expired. Start the sign-in again.".into())));
+                }
+            },
+            move || crash.send(Msg::SignedOut(Some(CRASHED.into()))),
+        );
     }
 
+    /// `gh auth token` runs on the worker: it can take a while, and the UI
+    /// thread doesn't wait for subprocesses.
     fn gh_cli_login(&mut self) {
-        match auth::gh_cli_token() {
-            Some(token) => {
-                self.auth = Auth::SignedOut { device: None, busy: true, error: None };
-                self.validate(token, true);
-            }
-            None => {
-                self.auth = Auth::SignedOut {
-                    device: None,
-                    busy: false,
-                    error: Some("No GitHub CLI login found. Run `gh auth login` first, or sign in with GitHub.".into()),
+        self.auth = Auth::SignedOut { device: None, busy: true, error: None };
+        let (sink, crash) = (self.sink.clone(), self.sink.clone());
+        spawn(
+            move || match auth::gh_cli_token() {
+                Some(token) => check_token(&sink, token, true),
+                None => {
+                    sink.send(Msg::SignedOut(Some("No GitHub CLI login found. Run `gh auth login` first, or sign in with GitHub.".into())))
                 }
-            }
-        }
+            },
+            move || crash.send(Msg::SignedOut(Some(CRASHED.into()))),
+        );
     }
 
     fn sign_out(&mut self) {
+        // Here, not on a worker: a sign-in right after must not race the delete.
         auth::forget_token();
+        self.drop_session(None);
+        self.notice = Some("Signed out. The login is gone from the keychain.".into());
+    }
+
+    /// GitHub turned the login down (401): forget it and go back to sign-in.
+    fn expired(&mut self) {
+        auth::forget_token();
+        self.drop_session(Some(github::Error::Expired.to_string()));
+    }
+
+    /// Back to the sign-in page. Results still on their way from this
+    /// session are dropped when they arrive (`generation`).
+    fn drop_session(&mut self, error: Option<String>) {
+        self.generation += 1;
         self.plugins.clear();
         self.checked_at = None;
-        self.auth = Auth::SignedOut { device: None, busy: false, error: None };
-        self.notice = Some("Signed out. The login is gone from the keychain.".into());
+        self.repos_loading = false;
+        self.repos_error = None;
+        self.auth = Auth::SignedOut { device: None, busy: false, error };
     }
 
     fn gh(&self) -> Option<Gh> {
@@ -347,76 +500,119 @@ impl App {
     /// can't are simply not listed.
     fn refresh(&mut self) {
         let Some(gh) = self.gh() else { return };
+        self.generation += 1;
+        let generation = self.generation;
         self.repos_loading = true;
         self.repos_error = None;
-        let whitelist = self.cfg.whitelist.clone();
-        let sink = self.sink.clone();
-        spawn(move || {
-            let results: Vec<Result<Option<Repo>, String>> = std::thread::scope(|s| {
-                let handles: Vec<_> = whitelist.iter().map(|full| s.spawn(|| gh.repo(full.trim()))).collect();
-                handles.into_iter().map(|h| h.join().unwrap_or(Ok(None))).collect()
-            });
-            let mut repos = Vec::new();
-            for r in results {
-                match r {
-                    Ok(Some(repo)) => repos.push(repo),
-                    Ok(None) => {}
-                    Err(e) => return sink.send(Msg::Repos(Err(e))),
+        // An entry that isn't owner/repo would fail the whole request: skip it and say so.
+        let (whitelist, junk): (Vec<String>, Vec<String>) =
+            self.cfg.whitelist.iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).partition(|s| config::is_repo_name(s));
+        if !junk.is_empty() {
+            self.notice = Some(format!("Skipped {} in the whitelist of config.json: not owner/repo.", junk.join(", ")));
+        }
+        let (sink, crash) = (self.sink.clone(), self.sink.clone());
+        spawn(
+            move || {
+                let results: Vec<github::Result<Option<Repo>>> = std::thread::scope(|s| {
+                    let handles: Vec<_> = whitelist.iter().map(|full| s.spawn(|| gh.repo(full))).collect();
+                    handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(github::Error::Other(CRASHED.into())))).collect()
+                });
+                let mut repos: Vec<Repo> = Vec::new();
+                for r in results {
+                    match r {
+                        // The same repo twice (another spelling in the whitelist) is one row.
+                        Ok(Some(repo)) if !repos.iter().any(|known| known.full_name == repo.full_name) => repos.push(repo),
+                        Ok(_) => {}
+                        Err(e) => return sink.send(Msg::Repos { generation, result: Err(e) }),
+                    }
                 }
-            }
-            sink.send(Msg::Repos(Ok(repos)));
-        });
+                sink.send(Msg::Repos { generation, result: Ok(repos) });
+            },
+            move || crash.send(Msg::Repos { generation, result: Err(github::Error::Other(CRASHED.into())) }),
+        );
     }
 
-    fn fetch_details(&self, repo: Repo) {
+    /// Reads a repo's manifest, latest release and installed bundles, then
+    /// its picture unless that is already on screen. Always answers with
+    /// `Details`, even after a panic, so the row never stays CHECKING.
+    fn fetch_details(&self, repo: Repo, known: Known) {
         let Some(gh) = self.gh() else { return };
-        let sink = self.sink.clone();
-        spawn(move || {
-            let full = repo.full_name.clone();
-            let mut error = None;
-            let manifest = match gh.file(&full, manifest::FILE, &repo.default_branch) {
-                Ok(Some(bytes)) => Manifest::parse(&bytes, &repo.name).unwrap_or_else(|e| {
-                    error = Some(e);
-                    Manifest::from_readme("", &repo.name)
-                }),
-                Ok(None) => {
-                    let readme = gh.readme(&full).ok().flatten().unwrap_or_default();
-                    let mut m = Manifest::from_readme(&readme, &repo.name);
-                    if m.description.is_empty() {
-                        m.description = repo.description.clone().unwrap_or_default();
-                    }
-                    m
+        let generation = self.generation;
+        let (sink, crash) = (self.sink.clone(), self.sink.clone());
+        let (crash_repo, crash_known) = (repo.clone(), known.clone());
+        spawn(
+            move || {
+                let full = repo.full_name.clone();
+                let manifest = match gh.file(&full, manifest::FILE, &repo.default_branch) {
+                    Ok(Some(bytes)) => Ok(Manifest::parse(&bytes, &repo.name)),
+                    Ok(None) => gh.readme(&full).map(|readme| {
+                        let mut m = Manifest::from_readme(&readme.unwrap_or_default(), &repo.name);
+                        if m.description.is_empty() {
+                            m.description = repo.description.clone().unwrap_or_default();
+                        }
+                        Ok(m)
+                    }),
+                    Err(e) => Err(e),
+                };
+                let release = gh.latest_release(&full);
+                if matches!(manifest, Err(github::Error::Expired)) || matches!(release, Err(github::Error::Expired)) {
+                    return sink.send(Msg::Expired { generation });
                 }
-                Err(e) => {
-                    error = Some(e);
-                    Manifest::from_readme("", &repo.name)
-                }
-            };
-            let release = gh.latest_release(&full).unwrap_or_else(|e| {
-                error.get_or_insert(e);
-                None
-            });
-            let image = manifest.image.clone();
-            sink.send(Msg::Details { full: full.clone(), manifest, release, error });
+                // An unreachable GitHub and a broken hurentohn.json both keep what the row knew.
+                let manifest = manifest.map_err(String::from).and_then(|m| m);
+                let mut details = Details::resolve(&repo.name, manifest, release.map_err(String::from), &known);
+                details.installed = Installed::scan(&details.manifest.bundles);
+                let image = details.manifest.image.clone();
+                sink.send(Msg::Details { generation, full: full.clone(), details });
 
-            let bytes = if image.is_empty() {
-                None
-            } else if image.starts_with("https://") || image.starts_with("http://") {
-                gh.url_bytes(&image).ok().flatten()
-            } else {
-                gh.file(&full, &image, &repo.default_branch).ok().flatten()
+                if known.image.as_deref() == Some(image.as_str()) {
+                    return;
+                }
+                let bytes = if image.is_empty() {
+                    None
+                } else if image.starts_with("https://") || image.starts_with("http://") {
+                    gh.url_bytes(&image).ok().flatten()
+                } else {
+                    gh.file(&full, &image, &repo.default_branch).ok().flatten()
+                };
+                match bytes.and_then(|b| decode(&b)) {
+                    Some((color, gray)) => sink.send(Msg::Image { full, source: image, color, gray }),
+                    None => sink.send(Msg::ImageMissing(full)),
+                }
+            },
+            move || {
+                let mut details = Details::resolve(&crash_repo.name, Err(CRASHED.into()), Err(CRASHED.into()), &crash_known);
+                details.installed = Installed::scan(&details.manifest.bundles);
+                crash.send(Msg::Details { generation, full: crash_repo.full_name, details });
+            },
+        );
+    }
+
+    /// Runs an install or build on a worker. However it ends, a panic
+    /// included, the row gets one `Finished` with what is on disk now, read
+    /// on the worker rather than the UI thread.
+    fn spawn_job(&mut self, full: String, bundles: Vec<String>, body: impl FnOnce(&Sink) -> Outcome + Send + 'static) {
+        self.running.insert(full.clone());
+        let sink = self.sink.clone();
+        std::thread::spawn(move || {
+            let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| body(&sink))).unwrap_or_else(|_| Err((CRASHED.into(), None)));
+            let job = match outcome {
+                Ok(text) => Job::Done(text),
+                Err((message, log)) => Job::Failed { message, log },
             };
-            match bytes.and_then(|b| decode(&b)) {
-                Some((color, gray)) => sink.send(Msg::Image { full, color, gray }),
-                None => sink.send(Msg::ImageMissing(full)),
-            }
+            let installed = Installed::scan(&bundles);
+            sink.send(Msg::Finished { full, job, installed });
         });
     }
 
     fn start_install(&mut self, idx: usize) {
         let Some(gh) = self.gh() else { return };
         let p = &mut self.plugins[idx];
-        let (Some(release), Some(_)) = (p.release.clone(), p.manifest.as_ref()) else { return };
+        if self.running.contains(&p.repo.full_name) {
+            return;
+        }
+        let (Some(release), Some(manifest)) = (p.release.clone(), p.manifest.as_ref()) else { return };
+        let bundles = manifest.bundles.clone();
         let Some(asset) = release.installer().cloned() else {
             let message = format!("Release {} has no *{} to install.", release.tag_name, platform::INSTALLER_SUFFIX);
             p.job = Job::Failed { message, log: None };
@@ -425,33 +621,31 @@ impl App {
         let full = p.repo.full_name.clone();
         let name = p.name().to_string();
         p.job = Job::Working { title: "DOWNLOADING".into(), frac: Some(0.0), detail: asset.name.clone() };
-        let sink = self.sink.clone();
-        spawn(move || {
+        self.spawn_job(full.clone(), bundles, move |sink| {
             let dir = config::download_dir();
             let _ = std::fs::create_dir_all(&dir);
             let dest = dir.join(&asset.name);
-            let cached = std::fs::metadata(&dest).map(|m| m.len() == asset.size).unwrap_or(false);
+            let cached = asset.size > 0 && std::fs::metadata(&dest).is_ok_and(|m| m.len() == asset.size);
             if !cached {
                 let mut last = -1i32;
-                let result = gh.download_asset(&full, &asset, &dest, |done, total| {
+                gh.download_asset(&full, &asset, &dest, |done, total| {
                     let pct = (done as f64 / total.max(1) as f64 * 100.0) as i32;
                     if pct != last {
                         last = pct;
                         sink.working(&full, "DOWNLOADING", Some(pct as f32 / 100.0), asset.name.clone());
                     }
-                });
-                if let Err(message) = result {
-                    return sink.job(&full, Job::Failed { message, log: None });
-                }
+                })
+                .map_err(|e| (e.to_string(), None))?;
             }
             sink.working(&full, "INSTALLING", None, platform::INSTALL_DETAIL);
-            if let Err(message) = privileged::install_release(&dest, &name) {
-                return sink.job(&full, Job::Failed { message, log: None });
-            }
+            let result = privileged::install_release(&dest, &name);
+            // Downloaded again next time: a damaged file isn't retried forever, and the cache doesn't grow.
+            let _ = std::fs::remove_file(&dest);
+            result.map_err(|message| (message, None))?;
             privileged::refresh_audio_units();
             let record = InstallRecord::Release { tag: release.tag_name.clone(), bundle_version: release.version().to_string() };
             sink.send(Msg::Record { full: full.clone(), record });
-            sink.job(&full, Job::Done(format!("{name} {} is installed.", release.version())));
+            Ok(format!("{name} {} is installed.", release.version()))
         });
     }
 
@@ -459,40 +653,52 @@ impl App {
         let Some(gh) = self.gh() else { return };
         let juce = self.cfg.juce();
         let p = &mut self.plugins[idx];
+        if self.running.contains(&p.repo.full_name) {
+            return;
+        }
         let Some(manifest) = p.manifest.clone() else { return };
         let full = p.repo.full_name.clone();
         let branch = p.repo.default_branch.clone();
         let name = p.name().to_string();
         p.job = Job::Working { title: "FETCHING MAIN".into(), frac: None, detail: format!("{full}@{branch}") };
-        let sink = self.sink.clone();
-        spawn(move || {
-            let head = match gh.branch_head(&full, &branch) {
-                Ok(h) => h,
-                Err(message) => return sink.job(&full, Job::Failed { message, log: None }),
-            };
-            let short = head.sha[..7.min(head.sha.len())].to_string();
-            let built = build::build_main(gh.token(), &full, &branch, &head.sha, &manifest, juce.as_deref(), |step| match step {
-                build::Step::Fetching => sink.working(&full, "FETCHING MAIN", None, format!("{branch} @ {short}")),
-                build::Step::Configuring => sink.working(&full, "CONFIGURING", None, "cmake"),
-                build::Step::Output(line) => sink.working(&full, "BUILDING", None, line),
-                build::Step::Compiling { done, total, line } => {
-                    let detail = line.split_once("] ").map(|(_, rest)| rest).unwrap_or(&line).to_string();
-                    sink.working(&full, &format!("COMPILING {done}/{total}"), Some(done as f32 / total.max(1) as f32), detail);
-                }
-            });
-            let built = match built {
-                Ok(b) => b,
-                Err(e) => return sink.job(&full, Job::Failed { message: e.message, log: Some(e.log) }),
-            };
-            sink.working(&full, "INSTALLING", None, format!("into {}", platform::SYSTEM_DIR_LABEL));
-            if let Err(message) = privileged::install_bundles(&built.bundles, &name) {
-                return sink.job(&full, Job::Failed { message, log: Some(built.log) });
+        let bundles = manifest.bundles.clone();
+        self.spawn_job(full.clone(), bundles, move |sink| {
+            let head = gh.branch_head(&full, &branch).map_err(|e| (e.to_string(), None))?;
+            let short = |sha: &str| sha[..7.min(sha.len())].to_string();
+            let built = {
+                // One build at a time; the lock is let go before the install,
+                // so a password prompt doesn't hold up the next build.
+                let _turn = build::wait_turn(|| {
+                    sink.working(&full, "WAITING FOR BUILD", None, "Another plugin is building; this one starts after it.")
+                });
+                // Ninja prints a line per step; the row needs a few updates a second, not thousands.
+                let mut sent: Option<Instant> = None;
+                build::build_main(gh.token(), &full, &branch, &head.sha, &manifest, juce.as_deref(), |step| {
+                    let frequent = matches!(step, build::Step::Compiling { done, total, .. } if done < total)
+                        || matches!(step, build::Step::Output(_));
+                    if frequent && sent.is_some_and(|t| t.elapsed() < Duration::from_millis(100)) {
+                        return;
+                    }
+                    sent = Some(Instant::now());
+                    match step {
+                        build::Step::Fetching => sink.working(&full, "FETCHING MAIN", None, format!("{branch} @ {}", short(&head.sha))),
+                        build::Step::Configuring => sink.working(&full, "CONFIGURING", None, "cmake"),
+                        build::Step::Output(line) => sink.working(&full, "BUILDING", None, line),
+                        build::Step::Compiling { done, total, line } => {
+                            let detail = line.split_once("] ").map(|(_, rest)| rest).unwrap_or(&line).to_string();
+                            sink.working(&full, &format!("COMPILING {done}/{total}"), Some(done as f32 / total.max(1) as f32), detail);
+                        }
+                    }
+                })
             }
+            .map_err(|e| (e.message, Some(e.log)))?;
+            sink.working(&full, "INSTALLING", None, format!("into {}", platform::SYSTEM_DIR_LABEL));
+            privileged::install_bundles(&built.bundles, &name).map_err(|message| (message, Some(built.log.clone())))?;
             privileged::refresh_audio_units();
             let bundle_version = built.bundles.first().and_then(|b| installed::bundle_version(b)).unwrap_or_default();
-            let record = InstallRecord::Main { sha: head.sha.clone(), committed_at: head.date, bundle_version };
+            let record = InstallRecord::Main { sha: built.sha.clone(), committed_at: head.date, bundle_version };
             sink.send(Msg::Record { full: full.clone(), record });
-            sink.job(&full, Job::Done(format!("{name} from main @ {short} is installed.")));
+            Ok(format!("{name} from main @ {} is installed.", short(&built.sha)))
         });
     }
 
@@ -513,12 +719,19 @@ impl App {
                 }
                 Msg::SignedOut(error) => self.auth = Auth::SignedOut { device: None, busy: false, error },
                 Msg::Offline(e) => self.auth = Auth::Offline(e),
+                Msg::Expired { generation } => {
+                    if generation == self.generation {
+                        self.expired();
+                    }
+                }
                 Msg::Device(code) => {
                     ctx.copy_text(code.user_code.clone());
                     open_url(&code.verification_uri);
                     self.auth = Auth::SignedOut { device: Some(code), busy: false, error: None };
                 }
-                Msg::Repos(Ok(repos)) => {
+                // From a refresh before the last refresh or sign-out.
+                Msg::Repos { generation, .. } if generation != self.generation => {}
+                Msg::Repos { result: Ok(repos), .. } => {
                     self.repos_loading = false;
                     self.checked_at = Some(Instant::now());
                     let mut old: Vec<Plugin> = std::mem::take(&mut self.plugins);
@@ -527,28 +740,47 @@ impl App {
                             Some(i) => old.swap_remove(i),
                             None => Plugin::new(repo.clone()),
                         };
+                        // Started before a sign-out and still going: the row says so until it ends.
+                        if self.running.contains(&repo.full_name) && !p.busy() {
+                            p.job = Job::Working {
+                                title: "STILL RUNNING".into(),
+                                frac: None,
+                                detail: "Started before the last sign-in.".into(),
+                            };
+                        }
                         p.repo = repo.clone();
+                        let known = p.known();
                         self.plugins.push(p);
-                        self.fetch_details(repo);
+                        self.fetch_details(repo, known);
                     }
                 }
-                Msg::Repos(Err(e)) => {
+                Msg::Repos { result: Err(github::Error::Expired), .. } => self.expired(),
+                Msg::Repos { result: Err(e), .. } => {
                     self.repos_loading = false;
-                    self.repos_error = Some(e);
-                }
-                Msg::Details { full, manifest, release, error } => {
-                    if let Some(p) = self.plugin(&full) {
-                        p.manifest = Some(manifest);
-                        p.release = release;
-                        p.details_error = error;
-                        p.rescan();
+                    // Rows on screen stay; the footer says the refresh failed.
+                    if self.plugins.is_empty() {
+                        self.repos_error = Some(e.to_string());
+                    } else {
+                        self.notice = Some(format!("Refresh failed: {e}"));
                     }
                 }
-                Msg::Image { full, color, gray } => {
+                Msg::Details { generation, full, details } => {
+                    if generation == self.generation
+                        && let Some(p) = self.plugin(&full)
+                    {
+                        p.manifest = Some(details.manifest);
+                        p.release = details.release;
+                        p.release_checked = details.release_checked;
+                        p.installed = details.installed;
+                        p.details_error = details.error;
+                    }
+                }
+                Msg::Image { full, source, color, gray } => {
                     let c = ctx.load_texture(format!("{full}-color"), color, egui::TextureOptions::LINEAR);
                     let g = ctx.load_texture(format!("{full}-gray"), gray, egui::TextureOptions::LINEAR);
                     if let Some(p) = self.plugin(&full) {
                         p.image = Some((c, g));
+                        p.image_source = Some(source);
                         p.image_missing = false;
                     }
                 }
@@ -558,16 +790,18 @@ impl App {
                     }
                 }
                 Msg::Job { full, job } => {
-                    let done = match &job {
-                        Job::Done(text) => Some(text.clone()),
-                        _ => None,
-                    };
                     if let Some(p) = self.plugin(&full) {
-                        p.job = if done.is_some() { Job::Idle } else { job };
-                        p.rescan();
+                        p.job = job;
                     }
-                    if done.is_some() {
-                        self.notice = done;
+                }
+                Msg::Finished { full, job, installed } => {
+                    self.running.remove(&full);
+                    if let Job::Done(text) = &job {
+                        self.notice = Some(text.clone());
+                    }
+                    if let Some(p) = self.plugin(&full) {
+                        p.installed = installed;
+                        p.job = if matches!(job, Job::Done(_)) { Job::Idle } else { job };
                     }
                 }
                 Msg::Record { full, record } => {
@@ -653,7 +887,7 @@ impl App {
             x = r.left() - gap;
             r
         };
-        let updates = self.updates();
+        let updates = self.waiting.clone();
         if !updates.is_empty() {
             let r = place("UPDATE ALL", sheet::SM);
             let resp = theme::key(ui, r, "UPDATE ALL", KeyKind::Lit, true);
@@ -674,9 +908,15 @@ impl App {
         if r.clicked() {
             self.refresh();
         }
-        let r = theme::key(ui, place("SIGN OUT", sheet::SM), "SIGN OUT", KeyKind::Quiet, true);
+        // A job keeps running after a sign-out but its row would be gone: wait for it.
+        let busy = self.plugins.iter().any(Plugin::busy);
+        let r = theme::key(ui, place("SIGN OUT", sheet::SM), "SIGN OUT", KeyKind::Quiet, !busy);
         if r.hovered() {
-            self.help = Some(format!("Signs {login} out and forgets the login stored on this computer."));
+            self.help = Some(if busy {
+                "Wait for the running install or build to finish before signing out.".into()
+            } else {
+                format!("Signs {login} out and forgets the login stored on this computer.")
+            });
         }
         if r.clicked() {
             self.sign_out();
@@ -879,14 +1119,12 @@ impl App {
         theme::text(&painter, c, Align2::CENTER_CENTER, sentence, theme::font(Face::Text, size::EMPTY), col::INK_SOFT, 0.0);
         if retry {
             let r = Rect::from_center_size(c + vec2(0.0, 40.0), vec2(110.0, 30.0));
-            if theme::key(ui, r, "TRY AGAIN", KeyKind::Outline, true).clicked() {
-                match auth::load_token() {
-                    Some(token) => {
-                        self.auth = Auth::Checking;
-                        self.validate(token, false);
-                    }
-                    None => self.auth = Auth::SignedOut { device: None, busy: false, error: None },
-                }
+            let resp = theme::key(ui, r, "TRY AGAIN", KeyKind::Outline, true);
+            if resp.hovered() {
+                self.help = Some(format!("Signs in again now. HurenTohn also tries by itself every {} seconds.", RETRY.as_secs()));
+            }
+            if resp.clicked() {
+                self.validate_stored();
             }
         }
     }
@@ -898,9 +1136,8 @@ impl App {
         theme::section_tag(&painter, pos2(left, top), "A", "Plugins");
 
         // Legend row: the counts. UPDATE ALL lives in the masthead.
-        let updates = self.updates();
         let x = x0 + sheet::RIGHT;
-        let count = match (self.plugins.len(), updates.len()) {
+        let count = match (self.plugins.len(), self.waiting.len()) {
             (n, 0) => format!("{n} PLUGINS"),
             (n, 1) => format!("{n} PLUGINS · 1 UPDATE"),
             (n, u) => format!("{n} PLUGINS · {u} UPDATES"),
@@ -975,7 +1212,14 @@ impl App {
         let tx = well.right() + sheet::GROUP_GAP;
         let ax = x0 + sheet::RIGHT - ACTION_W;
         let tw = ax - sheet::GROUP_GAP - tx;
-        let m = p.manifest.clone().unwrap_or_else(|| Manifest { name: p.repo.name.clone(), ..Default::default() });
+        let fallback;
+        let m = match &p.manifest {
+            Some(m) => m,
+            None => {
+                fallback = Manifest { name: p.repo.name.clone(), ..Default::default() };
+                &fallback
+            }
+        };
         let (l, r) = m.wordmark();
         theme::wordmark(&painter, pos2(tx, y0 - 6.5), &l, &r, size::PRODUCT);
         let mut ty = y0 + 25.0;
@@ -1065,6 +1309,7 @@ impl App {
             Status::UpToDate => "UP TO DATE",
             Status::Ahead => "NEWER THAN RELEASE",
             Status::MainBuild => "BUILD OF MAIN",
+            Status::Unknown => "CAN'T CHECK",
         };
         if status == Status::Update {
             let w = theme::key_width(&painter, status_label) - 8.0;
@@ -1133,6 +1378,7 @@ impl App {
             (Status::NotInstalled, Some(r)) => (format!("INSTALL {}", r.version()), KeyKind::Outline),
             (Status::UpToDate, Some(r)) => (format!("REINSTALL {}", r.version()), KeyKind::Quiet),
             (Status::Ahead | Status::MainBuild, Some(r)) => (format!("INSTALL RELEASE {}", r.version()), KeyKind::Quiet),
+            (Status::Unknown, _) => ("RELEASE UNKNOWN".into(), KeyKind::Quiet),
             _ => ("NO RELEASE".into(), KeyKind::Quiet),
         };
         let enabled = can_install && status != Status::Loading;
@@ -1143,6 +1389,9 @@ impl App {
                     format!("Downloads {name} {}'s installer from GitHub and {}.", r.version(), platform::INSTALL_HOW)
                 }
                 Some(r) => format!("Release {} has no installer for this computer.", r.tag_name),
+                None if status == Status::Unknown => {
+                    format!("GitHub didn't say which release of {name} is the latest. REFRESH asks again.")
+                }
                 None => format!("{name} has no release yet. BUILD FROM MAIN builds it from source."),
             });
         }
@@ -1193,7 +1442,7 @@ impl App {
             Auth::SignedIn { .. } => {
                 let missing =
                     self.plugins.iter().filter(|p| p.status(self.installs.0.get(&p.repo.full_name)) == Status::NotInstalled).count();
-                match (self.updates().len(), missing) {
+                match (self.waiting.len(), missing) {
                     (0, 0) => "Every plugin is up to date.".into(),
                     (0, 1) => format!("1 plugin is not in {} yet. INSTALL puts its release there.", platform::SYSTEM_DIR_LABEL),
                     (0, m) => format!("{m} plugins are not in {} yet. INSTALL puts a release there.", platform::SYSTEM_DIR_LABEL),
@@ -1288,7 +1537,16 @@ impl App {
             };
         }
         if let Some(p) = self.plugins.get_mut(3) {
-            p.job = Job::Working { title: "INSTALLING".into(), frac: None, detail: platform::INSTALL_DETAIL.into() };
+            p.job = Job::Working {
+                title: "WAITING FOR BUILD".into(),
+                frac: None,
+                detail: "Another plugin is building; this one starts after it.".into(),
+            };
+        }
+        if let Some(p) = self.plugins.get_mut(4) {
+            p.release = None;
+            p.release_checked = false;
+            p.details_error = Some("GitHub is not reachable: timeout".into());
         }
     }
 }
@@ -1297,6 +1555,17 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.drain(&ctx);
+        self.waiting = self.updates();
+        // Offline: try the stored login again by itself every RETRY.
+        if matches!(self.auth, Auth::Offline(_)) {
+            let at = *self.retry_at.get_or_insert_with(|| Instant::now() + RETRY);
+            let now = Instant::now();
+            if now >= at {
+                self.validate_stored();
+            } else {
+                ctx.request_repaint_after(at - now);
+            }
+        }
         self.fit_sheet(&ctx);
         #[cfg(target_os = "macos")]
         {
@@ -1378,6 +1647,10 @@ fn fit(size: egui::Vec2, area: Rect) -> Rect {
 /// version (Rec. 709 luma, dimmed to step back at rest).
 fn decode(bytes: &[u8]) -> Option<(ColorImage, ColorImage)> {
     let img = ::image::load_from_memory(bytes).ok()?.thumbnail(720, 480).to_rgba8();
+    // `fit` divides by the size.
+    if img.width() == 0 || img.height() == 0 {
+        return None;
+    }
     let size = [img.width() as usize, img.height() as usize];
     let colour = ColorImage::from_rgba_unmultiplied(size, img.as_raw());
     let gray: Vec<u8> = img
@@ -1418,5 +1691,57 @@ fn resize_edges(ui: &mut Ui, r: Rect) {
         if resp.drag_started() {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn repo() -> Repo {
+        Repo { full_name: "o/X".into(), name: "X".into(), default_branch: "main".into(), html_url: String::new(), description: None }
+    }
+
+    fn release(tag: &str) -> Release {
+        Release { tag_name: tag.into(), html_url: String::new(), published_at: None, assets: Vec::new() }
+    }
+
+    #[test]
+    fn a_failed_check_keeps_what_the_row_knew() {
+        let known = Known {
+            manifest: Some(Manifest { name: "X".into(), category: "Delay".into(), ..Default::default() }),
+            release: Some(Some(release("v1.2.0"))),
+            image: None,
+        };
+        let d = Details::resolve("X", Err("offline".into()), Err("offline".into()), &known);
+        assert_eq!(d.manifest.category, "Delay");
+        assert_eq!(d.release.map(|r| r.tag_name).as_deref(), Some("v1.2.0"));
+        assert!(d.release_checked);
+        assert_eq!(d.error.as_deref(), Some("offline"));
+    }
+
+    #[test]
+    fn a_first_check_that_fails_is_unknown_not_up_to_date() {
+        let d = Details::resolve("X", Err("offline".into()), Err("offline".into()), &Known::default());
+        let mut p = Plugin::new(repo());
+        p.manifest = Some(d.manifest);
+        p.release = d.release;
+        p.release_checked = d.release_checked;
+        p.installed.system = vec![installed::Copy { version: Some("1.0.0".into()) }];
+        assert!(p.status(None) == Status::Unknown);
+    }
+
+    #[test]
+    fn builds_of_main_match_two_part_versions() {
+        let mut p = Plugin::new(repo());
+        p.manifest = Some(Manifest::default());
+        p.release_checked = true;
+        p.installed.system = vec![installed::Copy { version: Some("0.3".into()) }];
+        let record = InstallRecord::Main { sha: "abc".into(), committed_at: "2026-10-01T00:00:00Z".into(), bundle_version: "0.3".into() };
+        assert!(p.status(Some(&record)) == Status::MainBuild);
+        // An unreadable recorded version matches nothing, not even "nothing installed".
+        p.installed.system.clear();
+        let unreadable = InstallRecord::Main { sha: "abc".into(), committed_at: String::new(), bundle_version: String::new() };
+        assert!(p.main_build(Some(&unreadable)).is_none());
     }
 }

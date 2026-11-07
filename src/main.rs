@@ -25,6 +25,11 @@ fn icon() -> egui::IconData {
 }
 
 fn main() -> eframe::Result {
+    // Started again through UAC as the admin half of an install: do it and quit.
+    #[cfg(windows)]
+    if let Some(code) = privileged::admin_task() {
+        std::process::exit(code);
+    }
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("HurenTohn Plugin Manager")
         .with_app_id("de.grunau.hurentohn")

@@ -8,7 +8,11 @@ fn main() {
         res.set_icon("assets/AppIcon.ico")
             .set("ProductName", "HurenTohn Plugin Manager")
             .set("FileDescription", "HurenTohn Plugin Manager")
-            .set("CompanyName", "Jonas Grunau");
+            .set("CompanyName", "Jonas Grunau")
+            .set("LegalCopyright", "Copyright (C) 2026 Jonas Grunau")
+            // The name the installer gives it (packaging/windows/HurenTohn.iss).
+            .set("OriginalFilename", "HurenTohn Plugin Manager.exe")
+            .set("InternalName", "hurentohn");
         res.compile().expect("compile the Windows resources");
     }
 }

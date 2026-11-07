@@ -10,6 +10,9 @@
   #define Exe "..\..\target\release\hurentohn.exe"
 #endif
 #define AppName "HurenTohn Plugin Manager"
+#define SetupName "HurenTohn-Plugin-Manager-" + AppVersion + "-Windows-Setup"
+; The binary file version takes numbers only: 1.2.0-beta.1 -> 1.2.0.0.
+#define NumericVersion Copy(AppVersion, 1, Pos("-", AppVersion + "-") - 1)
 
 [Setup]
 AppId={{448ECD19-DA35-4734-9402-B2A99D8A17C9}
@@ -17,10 +20,14 @@ AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
 AppPublisher=Jonas Grunau
+AppCopyright=Copyright (C) 2026 Jonas Grunau
+VersionInfoVersion={#NumericVersion}.0
+VersionInfoTextVersion={#AppVersion}
+VersionInfoOriginalFileName={#SetupName}.exe
 DefaultDirName={autopf}\{#AppName}
 DisableProgramGroupPage=yes
 DisableDirPage=yes
-OutputBaseFilename=HurenTohn-Plugin-Manager-{#AppVersion}-Windows-Setup
+OutputBaseFilename={#SetupName}
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=lowest

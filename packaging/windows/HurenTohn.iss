@@ -23,7 +23,11 @@ AppPublisher=Jonas Grunau
 AppCopyright=Copyright (C) 2026 Jonas Grunau
 VersionInfoVersion={#NumericVersion}.0
 VersionInfoTextVersion={#AppVersion}
+; Inno cuts version strings to the slot in its setup stub (50 characters for
+; this one) without a word, so a longer pre-release name leaves it empty.
+#if Len(SetupName + ".exe") <= 50
 VersionInfoOriginalFileName={#SetupName}.exe
+#endif
 DefaultDirName={autopf}\{#AppName}
 DisableProgramGroupPage=yes
 DisableDirPage=yes

@@ -29,7 +29,7 @@ const RETRY: Duration = Duration::from_secs(30);
 /// How long COPY CODE reads COPIED after a click.
 const COPIED_FOR: Duration = Duration::from_secs(2);
 /// What a worker reports when it panicked, so nothing waits on it forever.
-const CRASHED: &str = "HurenTohn hit an internal error. Try again.";
+const CRASHED: &str = "HT Plugin Manager hit an internal error. Try again.";
 
 // ---------------------------------------------------------------------------
 // Messages from the worker threads
@@ -256,7 +256,7 @@ impl Plugin {
         matches!(self.job, Job::Working { .. })
     }
 
-    /// A build of main is recognised by the record HurenTohn wrote when it
+    /// A build of main is recognised by the record HT Plugin Manager wrote when it
     /// installed it, as long as the bundle on disk still has that version
     /// (compared as versions: the plist may say `0.3`, the scan `0.3.0`).
     fn main_build<'a>(&self, record: Option<&'a InstallRecord>) -> Option<(&'a str, &'a str)> {
@@ -296,7 +296,7 @@ struct Snapshot {
     path: PathBuf,
     settled_frames: u32,
     requested: bool,
-    /// `HURENTOHN_SNAPSHOT_STATE=busy` stages an update, a build and a failure
+    /// `HTPM_SNAPSHOT_STATE=busy` stages an update, a build and a failure
     /// on the real data, so the screenshot loop sees every row state.
     busy: bool,
 }
@@ -360,17 +360,17 @@ impl App {
             waiting: Vec::new(),
             help: None,
             notice: cfg_error,
-            snapshot: std::env::var_os("HURENTOHN_SNAPSHOT").map(|p| Snapshot {
+            snapshot: std::env::var_os("HTPM_SNAPSHOT").map(|p| Snapshot {
                 path: p.into(),
                 settled_frames: 0,
                 requested: false,
-                busy: std::env::var("HURENTOHN_SNAPSHOT_STATE").is_ok_and(|s| s == "busy"),
+                busy: std::env::var("HTPM_SNAPSHOT_STATE").is_ok_and(|s| s == "busy"),
             }),
         };
         app.check_helper();
-        // HURENTOHN_SNAPSHOT_STATE=signed-out renders the sign-in page without touching the stored login,
+        // HTPM_SNAPSHOT_STATE=signed-out renders the sign-in page without touching the stored login,
         // =device the page with a (made-up) device code.
-        let shot_state = std::env::var("HURENTOHN_SNAPSHOT_STATE").ok().filter(|_| app.snapshot.is_some());
+        let shot_state = std::env::var("HTPM_SNAPSHOT_STATE").ok().filter(|_| app.snapshot.is_some());
         match shot_state.as_deref() {
             Some("signed-out") => app.auth = Auth::SignedOut { device: None, busy: false, error: None },
             Some("device") => {
@@ -575,7 +575,7 @@ impl App {
                 if matches!(manifest, Err(github::Error::Expired)) || matches!(release, Err(github::Error::Expired)) {
                     return sink.send(Msg::Expired { generation });
                 }
-                // An unreachable GitHub and a broken hurentohn.json both keep what the row knew.
+                // An unreachable GitHub and a broken ht-plugin-manager.json both keep what the row knew.
                 let manifest = manifest.map_err(String::from).and_then(|m| m);
                 let mut details = Details::resolve(&repo.name, manifest, release.map_err(String::from), &known);
                 details.installed = Installed::scan(&details.manifest.bundles);
@@ -901,8 +901,8 @@ impl App {
     fn masthead(&mut self, ui: &mut Ui, x0: f32) {
         let painter = ui.painter().clone();
         let top = ui.max_rect().top();
-        // The logo: the LEFT/RIGHT wordmark, then what it is, in the same face and size.
-        let mark = theme::wordmark(&painter, pos2(x0 + sheet::LEFT, top + 14.0), "HUREN", "TOHN", size::WORDMARK);
+        // The logo: HT, then what it is, in the same face and size.
+        let mark = theme::wordmark(&painter, pos2(x0 + sheet::LEFT, top + 14.0), "HT", "", size::WORDMARK);
         let name_font = theme::font(Face::Label, size::WORDMARK);
         theme::text(
             &painter,
@@ -1010,7 +1010,7 @@ impl App {
             if resp.hovered() {
                 self.help = Some(
                     match glyph {
-                        theme::WindowGlyph::Close => "Closes HurenTohn. Running downloads and builds stop.",
+                        theme::WindowGlyph::Close => "Closes HT Plugin Manager. Running downloads and builds stop.",
                         theme::WindowGlyph::Zoom => "Fills the screen with the window, or brings it back.",
                         theme::WindowGlyph::Minimize => "Puts the window away into the Dock / taskbar.",
                     }
@@ -1194,7 +1194,7 @@ impl App {
             let r = Rect::from_center_size(c + vec2(0.0, 40.0), vec2(110.0, 30.0));
             let resp = theme::key(ui, r, "TRY AGAIN", KeyKind::Outline, true);
             if resp.hovered() {
-                self.help = Some(format!("Signs in again now. HurenTohn also tries by itself every {} seconds.", RETRY.as_secs()));
+                self.help = Some(format!("Signs in again now. HT Plugin Manager also tries by itself every {} seconds.", RETRY.as_secs()));
             }
             if resp.clicked() {
                 self.validate_stored();

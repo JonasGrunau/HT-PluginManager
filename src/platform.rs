@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 #[cfg(not(any(target_os = "macos", windows)))]
-compile_error!("HurenTohn runs on macOS and Windows.");
+compile_error!("HT Plugin Manager runs on macOS and Windows.");
 
 pub fn home() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).unwrap_or_else(|| ".".into()))
@@ -17,7 +17,7 @@ pub fn is_au(bundle: &str) -> bool {
 }
 
 /// Starts `cmd` and waits for it on a short-lived thread, so a finished
-/// `open` doesn't linger as a zombie process until HurenTohn quits.
+/// `open` doesn't linger as a zombie process until HT Plugin Manager quits.
 fn spawn_detached(mut cmd: Command) {
     if let Ok(mut child) = cmd.spawn() {
         std::thread::spawn(move || {
@@ -53,13 +53,13 @@ mod imp {
     pub const UNINSTALL_HOW: &str = "macOS asks for your password first";
 
     pub fn support_dir() -> PathBuf {
-        home().join("Library/Application Support/HurenTohn")
+        home().join("Library/Application Support/HT Plugin Manager")
     }
     pub fn download_dir() -> PathBuf {
-        home().join("Library/Caches/HurenTohn/downloads")
+        home().join("Library/Caches/HT Plugin Manager/downloads")
     }
     pub fn log_dir() -> PathBuf {
-        home().join("Library/Logs/HurenTohn")
+        home().join("Library/Logs/HT Plugin Manager")
     }
 
     /// Apps started from Finder only get /usr/bin:/bin:/usr/sbin:/sbin,
@@ -99,13 +99,13 @@ mod imp {
         std::env::var_os(var).map(PathBuf::from).unwrap_or_else(home)
     }
     pub fn support_dir() -> PathBuf {
-        env_dir("APPDATA").join("HurenTohn")
+        env_dir("APPDATA").join("HT Plugin Manager")
     }
     pub fn download_dir() -> PathBuf {
-        env_dir("LOCALAPPDATA").join(r"HurenTohn\downloads")
+        env_dir("LOCALAPPDATA").join(r"HT Plugin Manager\downloads")
     }
     pub fn log_dir() -> PathBuf {
-        env_dir("LOCALAPPDATA").join(r"HurenTohn\logs")
+        env_dir("LOCALAPPDATA").join(r"HT Plugin Manager\logs")
     }
     pub fn tool_path() -> String {
         std::env::var("PATH").unwrap_or_default()

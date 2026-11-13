@@ -1,9 +1,9 @@
-//! `hurentohn.json`, the file each plug-in repo keeps at its root so the
+//! `ht-plugin-manager.json`, the file each plug-in repo keeps at its root so the
 //! manager can show and build it. Repos without one fall back to their README.
 
 use serde::Deserialize;
 
-pub const FILE: &str = "hurentohn.json";
+pub const FILE: &str = "ht-plugin-manager.json";
 
 #[derive(Deserialize, Clone, Debug, Default)]
 #[serde(default)]

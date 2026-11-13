@@ -1,4 +1,4 @@
-"""Draws the HurenTohn app icon in the house style: assets/AppIcon.icns (macOS),
+"""Draws the HT Plugin Manager app icon in the house style: assets/AppIcon.icns (macOS),
 AppIcon.ico (Windows) and AppIcon.png (window icon).
 
 The graphite sheet, an H/T wordmark in Plex Sans Condensed SemiBold with the

@@ -1,7 +1,7 @@
-# HurenTohn Plugin Manager
+# HT Plugin Manager
 
 ## Purpose
-Plugin manager (Rust, egui/eframe 0.36) for Jonas's JUCE plugins, on macOS and Windows. It signs in to GitHub (device flow, or the `gh` CLI token; the token goes into the keychain / Credential Manager through `keyring`) and lists the whitelisted repos the account can see; repos it can't see are left out silently. Per repo it reads `hurentohn.json` (README fallback), the latest release and the installed bundle versions. It installs the release's platform installer without a wizard, or builds `main` locally and installs the bundles. On macOS a root helper behind a one-command sudoers rule makes installs password-free after one prompt; on Windows each install shows one UAC prompt.
+Plugin manager (Rust, egui/eframe 0.36) for Jonas's JUCE plugins, on macOS and Windows. It signs in to GitHub (device flow, or the `gh` CLI token; the token goes into the keychain / Credential Manager through `keyring`) and lists the whitelisted repos the account can see; repos it can't see are left out silently. Per repo it reads `ht-plugin-manager.json` (README fallback), the latest release and the installed bundle versions. It installs the release's platform installer without a wizard, or builds `main` locally and installs the bundles. On macOS a root helper behind a one-command sudoers rule makes installs password-free after one prompt; on Windows each install shows one UAC prompt.
 
 ## Key files
 | File | What |
@@ -12,12 +12,12 @@ Plugin manager (Rust, egui/eframe 0.36) for Jonas's JUCE plugins, on macOS and W
 | `src/privileged/` | `macos.rs`: the root helper script, its sudoers rule, `install_release` (pkg), `install_bundles`, the `osascript` admin-prompt fallback (command passed as argv, never interpolated). `windows.rs`: `Setup.exe /VERYSILENT` through `ShellExecuteExW` "runas"; builds of main and uninstalls run in the app itself, started again as admin (`admin_task`, `--admin-…-bundles` argv), which checks the names again and only writes to the system plug-in folder. No PowerShell or script files: a hidden elevated `-ExecutionPolicy Bypass` script is what antivirus heuristics flag |
 | `src/github.rs` | REST calls (ureq 3, `http_status_as_error(false)`): user, repo (404/403 → `None`), latest release, contents (raw), asset download, device flow |
 | `src/build.rs` | Build of main: shallow fetch of the exact sha, CMake (Ninja on macOS, Visual Studio on Windows), progress from `[n/m]`, log file |
-| `src/manifest.rs` | `hurentohn.json` schema, defaults, README fallback, wordmark split |
+| `src/manifest.rs` | `ht-plugin-manager.json` schema, defaults, README fallback, wordmark split |
 | `src/installed.rs` | Bundle scan (system + user plugin folders), version from Info.plist or the VST3 `moduleinfo.json` (JSON5, read by hand), lenient semver |
 | `src/config.rs` | `config.json` (whitelist, client ID, JUCE dir, `helper_offered`), `installs.json` (provenance of builds of main) |
 | `build.rs` | Cargo build script: the Windows exe's icon and version resource (not the build-of-main module) |
 | `scripts/bundle.sh` | macOS `.app` (optionally universal), Developer ID signing (hardened runtime), DMG, notarization (CI env or 1Password), install |
-| `packaging/windows/HurenTohn.iss` | Inno Setup installer, per user |
+| `packaging/windows/ht-plugin-manager.iss` | Inno Setup installer, per user |
 | `.github/workflows/release.yml` | Tag → DMG + Windows Setup.exe → GitHub release (the plugin repos' pipeline, same secrets) |
 | `scripts/make-icon.py` | Draws `assets/AppIcon.{icns,ico,png}`: graphite sheet, centred H/T, crop marks |
 | `start.sh` | Builds the signed bundle and runs it in the foreground |
@@ -38,7 +38,7 @@ Plugin manager (Rust, egui/eframe 0.36) for Jonas's JUCE plugins, on macOS and W
 ## UI rules (house style, audio-plugin SDK `references/ui-design.md` §0)
 - Plex Sans Condensed (words) + Plex Mono (every number), flat drawing, one 2 px radius, crop marks, `[A]` section tags, `LEFT/RIGHT` wordmarks, one 880-wide sheet scaled as a whole (`fit_sheet` sets the egui zoom), footer help line drawn last so it shows this frame's hover. A hover help sentence takes the whole footer line; the state on the right comes back when the pointer leaves.
 - Palette graphite: true greys (chroma 0) on the house contrast ladder; no hue, so it never reads as one of the plugins. **ACCENT MEANS: what needs you or is happening now** (update waiting, job running, failure) = solid ink fill with sheet-coloured text. Secondary actions (BUILD FROM MAIN) are a hairline outline with inkFaint text, an outline key only under the pointer; at rest things step back to inkFaint.
-- Logo: `HUREN/TOHN` + `PLUGIN MANAGER` in the wordmark face and size, the second part in inkSoft. Sub-line `RELEASES AND BUILDS · HT-1 · vX.Y.Z`.
+- Logo: `HT` + `PLUGIN MANAGER` in the wordmark face and size, the second part in inkSoft. Sub-line `RELEASES AND BUILDS · HT-1 · vX.Y.Z`.
 - Title bar: 36 window points at every zoom (window chrome, not part of the scaled sheet: `TITLE_H / zoom` in egui points, a 1-point hairline), `well` grey, no text. macOS keeps its system frame and traffic lights (`with_fullsize_content_view`, transparent title bar); `place_traffic_lights` centres them vertically every frame (10.5 pt above and below, macOS's own 9 pt left inset). Windows has no system frame: the app draws minimize / zoom / close keys on the sheet's right margin, a hairline border, and edge resize zones (`BeginResize`).
 - The sign-in page is one centred block (heading, balanced two-line text, keys) with no footer. SIGN IN WITH GITHUB (lit) sits above USE GH CLI LOGIN (Secondary), both one width. The device code copies on a click (the code well or COPY CODE, which reads COPIED for 2 s). The OAuth client ID is built in (`config::GITHUB_CLIENT_ID`), and only a build with an empty one shows the gh CLI key alone, lit.
 - UPDATE ALL is the masthead's one primary action, far right, only while updates wait. The account name is in the footer.
@@ -47,7 +47,7 @@ Plugin manager (Rust, egui/eframe 0.36) for Jonas's JUCE plugins, on macOS and W
 - The list has depth: the legend above and the footer below cast a soft shadow (`theme::edge_shadow`, `SHADOW_H` deep, as wide as the rows) onto rows scrolled under them, fading in with how much list is hidden there. At the very top or bottom that edge has none.
 
 ## Verify
-1. `cargo test`, plus `HURENTOHN_TOKEN=$(gh auth token) cargo test --release -- --ignored builds_main` after touching `build.rs` or a manifest.
-2. Screenshot loop after any UI change: `HURENTOHN_TOKEN=$(gh auth token) HURENTOHN_SNAPSHOT=<png> ./target/release/hurentohn`, then with `HURENTOHN_SNAPSHOT_STATE=busy`, with `HURENTOHN_SNAPSHOT_STATE=signed-out`, with `HURENTOHN_SNAPSHOT_STATE=device` (sign-in code page), and with `HURENTOHN_SNAPSHOT_SIZE=2400x1300`. Read every PNG; fix through `theme.rs` tokens. The egui snapshot doesn't contain the system traffic lights: for those, and for `docs/screenshot.png`, capture the real window (`screencapture -o -l <window id>`, id from `CGWindowListCopyWindowInfo`).
+1. `cargo test`, plus `HTPM_TOKEN=$(gh auth token) cargo test --release -- --ignored builds_main` after touching `build.rs` or a manifest.
+2. Screenshot loop after any UI change: `HTPM_TOKEN=$(gh auth token) HTPM_SNAPSHOT=<png> ./target/release/ht-plugin-manager`, then with `HTPM_SNAPSHOT_STATE=busy`, with `HTPM_SNAPSHOT_STATE=signed-out`, with `HTPM_SNAPSHOT_STATE=device` (sign-in code page), and with `HTPM_SNAPSHOT_SIZE=2400x1300`. Read every PNG; fix through `theme.rs` tokens. The egui snapshot doesn't contain the system traffic lights: for those, and for `docs/screenshot.png`, capture the real window (`screencapture -o -l <window id>`, id from `CGWindowListCopyWindowInfo`).
 3. A normal (non-snapshot) start with `helper_offered: false` triggers the one-time admin prompt; test runs should use snapshot mode.
 4. Not testable here without a person at the prompt: `install_helper`, `install_release`, `install_bundles`. Their filter is checked by hand: `spctl -a -vv -t install <pkg>` must match the helper's grep.

@@ -1,4 +1,4 @@
-//! The GitHub REST calls HurenTohn makes, as the signed-in user.
+//! The GitHub REST calls HT Plugin Manager makes, as the signed-in user.
 
 use serde::Deserialize;
 use std::io::{Read, Write};
@@ -107,7 +107,7 @@ pub struct DeviceCode {
 fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .http_status_as_error(false)
-        .user_agent(concat!("HurenTohn/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("HT-Plugin-Manager/", env!("CARGO_PKG_VERSION")))
         .timeout_connect(Some(Duration::from_secs(15)))
         .timeout_recv_response(Some(Duration::from_secs(30)))
         .timeout_recv_body(Some(Duration::from_secs(60)))

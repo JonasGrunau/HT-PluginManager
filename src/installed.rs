@@ -12,7 +12,7 @@ pub struct Copy {
 
 #[derive(Clone, Debug, Default)]
 pub struct Installed {
-    /// Copies in the system folders releases install into: the ones HurenTohn manages.
+    /// Copies in the system folders releases install into: the ones HT Plugin Manager manages.
     pub system: Vec<Copy>,
     /// Copies in the user's own plugin folder, typically from a local
     /// `start.sh` build. Hosts see these too, so the list mentions them.

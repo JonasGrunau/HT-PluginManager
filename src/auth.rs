@@ -1,16 +1,16 @@
 //! Where the GitHub token lives: the macOS login keychain or the Windows
 //! Credential Manager, so a sign-in survives restarts.
 
-const SERVICE: &str = "de.grunau.hurentohn";
+const SERVICE: &str = "de.grunau.ht-plugin-manager";
 const ACCOUNT: &str = "github";
 
 fn entry() -> Option<keyring::Entry> {
     keyring::Entry::new(SERVICE, ACCOUNT).ok()
 }
 
-/// `HURENTOHN_TOKEN` (for development and snapshots) wins over the stored login.
+/// `HTPM_TOKEN` (for development and snapshots) wins over the stored login.
 pub fn load_token() -> Option<String> {
-    if let Ok(t) = std::env::var("HURENTOHN_TOKEN")
+    if let Ok(t) = std::env::var("HTPM_TOKEN")
         && !t.trim().is_empty()
     {
         return Some(t.trim().to_string());

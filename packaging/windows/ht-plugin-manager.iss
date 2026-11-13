@@ -1,5 +1,5 @@
-; HurenTohn Plugin Manager installer (Inno Setup 6). release.yml calls:
-;   ISCC.exe /DAppVersion=<version> /DExe=<path to hurentohn.exe> /O<out dir> packaging\windows\HurenTohn.iss
+; HT Plugin Manager installer (Inno Setup 6). release.yml calls:
+;   ISCC.exe /DAppVersion=<version> /DExe=<path to ht-plugin-manager.exe> /O<out dir> packaging\windows\ht-plugin-manager.iss
 ; It installs per user (no admin prompt); the app asks for admin rights only
 ; when it installs a plugin into Common Files\VST3.
 
@@ -7,10 +7,10 @@
   #define AppVersion "0.1.0"
 #endif
 #ifndef Exe
-  #define Exe "..\..\target\release\hurentohn.exe"
+  #define Exe "..\..\target\release\ht-plugin-manager.exe"
 #endif
-#define AppName "HurenTohn Plugin Manager"
-#define SetupName "HurenTohn-Plugin-Manager-" + AppVersion + "-Windows-Setup"
+#define AppName "HT Plugin Manager"
+#define SetupName "HT-Plugin-Manager-" + AppVersion + "-Windows-Setup"
 ; The binary file version takes numbers only: 1.2.0-beta.1 -> 1.2.0.0.
 #define NumericVersion Copy(AppVersion, 1, Pos("-", AppVersion + "-") - 1)
 

@@ -1,27 +1,27 @@
 #!/usr/bin/env bash
-# Builds "HurenTohn Plugin Manager.app" in target/ and signs it with the
+# Builds "HT Plugin Manager.app" in target/ and signs it with the
 # Developer ID the plugins use ("Developer ID Application: Jonas Grunau (JQ4STVWTQ3)").
 #   scripts/bundle.sh                    build + sign (native architecture)
 #   scripts/bundle.sh --universal        … arm64 + x86_64 in one binary
-#   scripts/bundle.sh --dmg              … and HurenTohn-Plugin-Manager-<v>-macOS.dmg (signed)
+#   scripts/bundle.sh --dmg              … and HT-Plugin-Manager-<v>-macOS.dmg (signed)
 #   scripts/bundle.sh --notarize         … and notarize + staple (the DMG with --dmg, else the app)
 #   scripts/bundle.sh --install          … and copy the app to /Applications
 #
-# Signing identity: HURENTOHN_SIGN_IDENTITY (default: the Developer ID above,
+# Signing identity: HTPM_SIGN_IDENTITY (default: the Developer ID above,
 # from the login keychain; "-" signs ad hoc, for builds without the certificate).
 # Notary credentials: NOTARY_APPLE_ID + NOTARY_PASSWORD + TEAM_ID when set (CI);
-# otherwise the notarytool keychain profile "hurentohn-notary", created on the
+# otherwise the notarytool keychain profile "ht-plugin-manager-notary", created on the
 # first --notarize from 1Password (the items the plugin release pipelines read).
-# HURENTOHN_GITHUB_CLIENT_ID, if set, overrides the OAuth client ID built into src/config.rs.
+# HTPM_GITHUB_CLIENT_ID, if set, overrides the OAuth client ID built into src/config.rs.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-IDENTITY=${HURENTOHN_SIGN_IDENTITY:-"Developer ID Application: Jonas Grunau (JQ4STVWTQ3)"}
+IDENTITY=${HTPM_SIGN_IDENTITY:-"Developer ID Application: Jonas Grunau (JQ4STVWTQ3)"}
 TEAM=${TEAM_ID:-JQ4STVWTQ3}
-PROFILE=hurentohn-notary
+PROFILE=ht-plugin-manager-notary
 OP_ACCOUNT=${OP_ACCOUNT:-my.1password.com}
-NAME="HurenTohn Plugin Manager"
-OUT=${HURENTOHN_OUT:-target}
+NAME="HT Plugin Manager"
+OUT=${HTPM_OUT:-target}
 
 universal=0 dmg=0 notarize=0 install=0
 for arg in "$@"; do
@@ -41,17 +41,17 @@ if (( universal )); then
     rustup target add aarch64-apple-darwin x86_64-apple-darwin >/dev/null
     cargo build --release --target aarch64-apple-darwin
     cargo build --release --target x86_64-apple-darwin
-    binary=target/hurentohn-universal
-    lipo -create -output "$binary" target/aarch64-apple-darwin/release/hurentohn target/x86_64-apple-darwin/release/hurentohn
+    binary=target/ht-plugin-manager-universal
+    lipo -create -output "$binary" target/aarch64-apple-darwin/release/ht-plugin-manager target/x86_64-apple-darwin/release/ht-plugin-manager
 else
     cargo build --release
-    binary=target/release/hurentohn
+    binary=target/release/ht-plugin-manager
 fi
 
 app="$OUT/$NAME.app"
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-cp "$binary" "$app/Contents/MacOS/hurentohn"
+cp "$binary" "$app/Contents/MacOS/ht-plugin-manager"
 cp assets/AppIcon.icns "$app/Contents/Resources/AppIcon.icns"
 cat > "$app/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -60,8 +60,8 @@ cat > "$app/Contents/Info.plist" <<EOF
 <dict>
     <key>CFBundleName</key><string>$NAME</string>
     <key>CFBundleDisplayName</key><string>$NAME</string>
-    <key>CFBundleIdentifier</key><string>de.grunau.hurentohn</string>
-    <key>CFBundleExecutable</key><string>hurentohn</string>
+    <key>CFBundleIdentifier</key><string>de.grunau.ht-plugin-manager</string>
+    <key>CFBundleExecutable</key><string>ht-plugin-manager</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>$version</string>
@@ -106,7 +106,7 @@ submit() {
 }
 
 if (( dmg )); then
-    out="$OUT/HurenTohn-Plugin-Manager-$version-macOS.dmg"
+    out="$OUT/HT-Plugin-Manager-$version-macOS.dmg"
     stage=$(mktemp -d)
     trap 'rm -rf "$stage"' EXIT
     ditto "$app" "$stage/$NAME.app"
@@ -128,7 +128,7 @@ if (( dmg )); then
     fi
     echo "dmg: $out"
 elif (( notarize )); then
-    zip="$OUT/HurenTohn-Plugin-Manager-$version.zip"
+    zip="$OUT/HT-Plugin-Manager-$version.zip"
     ditto -c -k --keepParent "$app" "$zip"
     submit "$zip"
     xcrun stapler staple "$app"

@@ -1,4 +1,4 @@
-//! Where HurenTohn keeps its files, the user-editable config and the record of
+//! Where HT Plugin Manager keeps its files, the user-editable config and the record of
 //! what it installed.
 
 use serde::{Deserialize, Serialize};
@@ -6,22 +6,22 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Client ID of the GitHub OAuth app that signs in through the device flow
-/// ("HurenTohn Plugin Manager", device flow on). Client IDs are public; the app
-/// needs no secret for the device flow. `HURENTOHN_GITHUB_CLIENT_ID` at build
+/// ("HT Plugin Manager", device flow on). Client IDs are public; the app
+/// needs no secret for the device flow. `HTPM_GITHUB_CLIENT_ID` at build
 /// time or `config.json` can override it.
-pub const GITHUB_CLIENT_ID: &str = match option_env!("HURENTOHN_GITHUB_CLIENT_ID") {
+pub const GITHUB_CLIENT_ID: &str = match option_env!("HTPM_GITHUB_CLIENT_ID") {
     Some(id) => id,
     None => "Ov23lioYTJ0fxEWmPnXo",
 };
 
 pub const DEFAULT_WHITELIST: [&str; 5] =
-    ["JonasGrunau/PsyBox", "JonasGrunau/PhaseFucker", "JonasGrunau/BuildApp", "JonasGrunau/VocAnal", "JonasGrunau/DisTitten"];
+    ["JonasGrunau/PsyBox", "JonasGrunau/PhaseFixer", "JonasGrunau/BuildApp", "JonasGrunau/VoxAl", "JonasGrunau/DisTherm"];
 
 /// Local JUCE checkouts tried for builds of main, so a build doesn't clone JUCE.
 const JUCE_CANDIDATES: [&str; 1] = ["Projects/open_music_analyzer/plugin/third_party/JUCE"];
 
-/// Config, install records and source checkouts (`~/Library/Application Support/HurenTohn`,
-/// `%APPDATA%\HurenTohn`); release installers and build logs live next to the caches.
+/// Config, install records and source checkouts (`~/Library/Application Support/HT Plugin Manager`,
+/// `%APPDATA%\HT Plugin Manager`); release installers and build logs live next to the caches.
 pub use crate::platform::{download_dir, home, log_dir, support_dir, tool_path};
 
 #[derive(Serialize, Deserialize, Clone)]

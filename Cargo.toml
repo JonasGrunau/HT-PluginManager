@@ -1,5 +1,5 @@
 [package]
-name = "hurentohn"
+name = "ht-plugin-manager"
 version = "0.1.0"
 edition = "2024"
 description = "Plug-in manager for Jonas Grunau's audio plug-ins: GitHub releases, silent pkg installs, builds of main"

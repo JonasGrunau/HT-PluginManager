@@ -1,4 +1,4 @@
-//! HurenTohn Plugin Manager: releases, silent installs and builds of main
+//! HT Plugin Manager: releases, silent installs and builds of main
 //! for Jonas Grunau's audio plugins.
 
 // No console window next to the app on Windows (release builds).
@@ -31,8 +31,8 @@ fn main() -> eframe::Result {
         std::process::exit(code);
     }
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title("HurenTohn Plugin Manager")
-        .with_app_id("de.grunau.hurentohn")
+        .with_title("HT Plugin Manager")
+        .with_app_id("de.grunau.ht-plugin-manager")
         .with_inner_size([theme::sheet::W, 850.0])
         .with_min_inner_size([660.0, 480.0])
         .with_icon(icon());
@@ -47,11 +47,11 @@ fn main() -> eframe::Result {
     {
         viewport = viewport.with_decorations(false);
     }
-    if std::env::var_os("HURENTOHN_SNAPSHOT").is_some() {
+    if std::env::var_os("HTPM_SNAPSHOT").is_some() {
         // A covered window gets no frames, so the screenshot would never come.
         viewport = viewport.with_window_level(egui::WindowLevel::AlwaysOnTop);
-        // HURENTOHN_SNAPSHOT_SIZE=1600x1100 checks how the sheet holds up in a big window.
-        if let Some((w, h)) = std::env::var("HURENTOHN_SNAPSHOT_SIZE").ok().and_then(|s| {
+        // HTPM_SNAPSHOT_SIZE=1600x1100 checks how the sheet holds up in a big window.
+        if let Some((w, h)) = std::env::var("HTPM_SNAPSHOT_SIZE").ok().and_then(|s| {
             let (w, h) = s.split_once('x')?;
             Some((w.parse::<f32>().ok()?, h.parse::<f32>().ok()?))
         }) {
@@ -64,5 +64,5 @@ fn main() -> eframe::Result {
         });
     }
     let options = eframe::NativeOptions { viewport, ..Default::default() };
-    eframe::run_native("HurenTohn Plugin Manager", options, Box::new(|cc| Ok(Box::new(app::App::new(cc)))))
+    eframe::run_native("HT Plugin Manager", options, Box::new(|cc| Ok(Box::new(app::App::new(cc)))))
 }

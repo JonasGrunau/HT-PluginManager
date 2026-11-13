@@ -14,8 +14,8 @@ use super::{HelperState, INSTALL_LOCK};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub const HELPER: &str = "/Library/PrivilegedHelperTools/de.grunau.hurentohn.helper";
-const SUDOERS: &str = "/etc/sudoers.d/hurentohn";
+pub const HELPER: &str = "/Library/PrivilegedHelperTools/de.grunau.ht-plugin-manager.helper";
+const SUDOERS: &str = "/etc/sudoers.d/ht-plugin-manager";
 
 /// Team of the "Developer ID Installer: Jonas Grunau" certificate the
 /// release pipelines sign with.
@@ -26,13 +26,13 @@ const EXIT_REJECTED: i32 = 3;
 fn helper_script() -> String {
     format!(
         r#"#!/bin/bash
-# HurenTohn install helper (written by HurenTohn, runs as root via {SUDOERS}).
+# HT Plugin Manager install helper (written by the app, runs as root via {SUDOERS}).
 #   pkg <file.pkg>      install a pkg headless, only if Gatekeeper accepts it as a
 #                       notarized Developer ID package from team {TEAM_ID}
 #   bundle <dir>        copy a locally built .vst3 / .component into /Library/Audio/Plug-Ins
 set -euo pipefail
 export PATH=/usr/bin:/bin:/usr/sbin:/sbin
-work=$(mktemp -d /private/var/tmp/hurentohn.XXXXXX)
+work=$(mktemp -d /private/var/tmp/ht-plugin-manager.XXXXXX)
 trap 'rm -rf "$work"' EXIT
 
 case "${{1:-}}" in
@@ -121,7 +121,7 @@ fn write_file_command(content: &str, dest: &str) -> String {
 /// installed.
 fn helper_install_command(user: &str) -> String {
     [
-        "d=$(mktemp -d /private/var/tmp/hurentohn-setup.XXXXXX)".to_string(),
+        "d=$(mktemp -d /private/var/tmp/ht-plugin-manager-setup.XXXXXX)".to_string(),
         r#"trap 'rm -rf "$d"' EXIT"#.to_string(),
         write_file_command(&helper_script(), r#""$d/helper""#),
         write_file_command(&format!("{user} ALL=(root) NOPASSWD: {HELPER}\n"), r#""$d/sudoers""#),
@@ -142,7 +142,7 @@ pub fn install_helper() -> Result<(), String> {
     }
     run_as_admin(
         &helper_install_command(&user),
-        "HurenTohn Plugin Manager wants to install plugin updates without asking every time. This is the only time it asks.",
+        "HT Plugin Manager wants to install plugin updates without asking every time. This is the only time it asks.",
     )?;
     match helper_state() {
         HelperState::Ready => Ok(()),
@@ -187,9 +187,9 @@ pub fn install_release(pkg: &Path, product: &str) -> Result<(), String> {
         // Not signed by our team (e.g. an unsigned release), or sudo said no: ask instead.
     }
     let prompt = if signed_by_us(pkg) {
-        format!("HurenTohn Plugin Manager wants to install {product}.")
+        format!("HT Plugin Manager wants to install {product}.")
     } else {
-        format!("HurenTohn Plugin Manager wants to install {product}. Careful: this package is not signed by Jonas Grunau's Developer ID.")
+        format!("HT Plugin Manager wants to install {product}. Careful: this package is not signed by Jonas Grunau's Developer ID.")
     };
     run_as_admin(&format!("/usr/sbin/installer -pkg {} -target /", sh_quote(&path)), &prompt)
 }
@@ -221,7 +221,7 @@ pub fn install_bundles(bundles: &[PathBuf], product: &str) -> Result<(), String>
         let (src, dst) = (sh_quote(&b.to_string_lossy()), sh_quote(&dest.to_string_lossy()));
         steps.push(format!("rm -rf {dst} && ditto --norsrc {src} {dst} && chown -R root:wheel {dst} && chmod -R u-s,g-s,go-w {dst}"));
     }
-    run_as_admin(&steps.join(" && "), &format!("HurenTohn Plugin Manager wants to install your build of {product}."))
+    run_as_admin(&steps.join(" && "), &format!("HT Plugin Manager wants to install your build of {product}."))
 }
 
 /// Removes the plug-in's bundles from /Library/Audio/Plug-Ins. Always through
@@ -235,7 +235,7 @@ pub fn uninstall_bundles(bundles: &[String], product: &str) -> Result<(), String
     }
     let _lock = INSTALL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let steps: Vec<String> = copies.iter().map(|c| format!("rm -rf -- {}", sh_quote(&c.to_string_lossy()))).collect();
-    run_as_admin(&steps.join(" && "), &format!("HurenTohn Plugin Manager wants to uninstall {product}."))
+    run_as_admin(&steps.join(" && "), &format!("HT Plugin Manager wants to uninstall {product}."))
 }
 
 /// Makes hosts see a new Audio Unit without a reboot.
@@ -264,7 +264,7 @@ mod tests {
 
     #[test]
     fn helper_script_is_valid_bash() {
-        let dir = std::env::temp_dir().join(format!("hurentohn-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ht-plugin-manager-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("helper");
         std::fs::write(&path, helper_script()).unwrap();

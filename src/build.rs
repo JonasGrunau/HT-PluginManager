@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, MutexGuard, TryLockError};
 
-const BUILD_DIR: &str = "build-hurentohn";
+const BUILD_DIR: &str = "build-ht-plugin-manager";
 
 /// One build at a time: each one uses every core, and JUCE builds take a
 /// gigabyte or two of memory apiece.
@@ -250,12 +250,12 @@ mod tests {
     }
 
     /// The whole path against GitHub and a real plug-in, minus the install:
-    /// `HURENTOHN_TOKEN=$(gh auth token) cargo test --release -- --ignored builds_main`
+    /// `HTPM_TOKEN=$(gh auth token) cargo test --release -- --ignored builds_main`
     #[test]
     #[ignore = "clones and compiles a plug-in (minutes)"]
     fn builds_main_of_a_real_plugin() {
-        let token = std::env::var("HURENTOHN_TOKEN").expect("HURENTOHN_TOKEN");
-        let full = std::env::var("HURENTOHN_TEST_REPO").unwrap_or_else(|_| "JonasGrunau/PhaseFucker".into());
+        let token = std::env::var("HTPM_TOKEN").expect("HTPM_TOKEN");
+        let full = std::env::var("HTPM_TEST_REPO").unwrap_or_else(|_| "JonasGrunau/PhaseFucker".into());
         let gh = crate::github::Gh::new(token.clone());
         let repo = gh.repo(&full).unwrap().expect("repo visible");
         let bytes = gh.file(&full, crate::manifest::FILE, &repo.default_branch).unwrap().expect("manifest");
@@ -301,7 +301,7 @@ mod tests {
 
     #[cfg(unix)]
     fn tempfile_log() -> std::fs::File {
-        let p = std::env::temp_dir().join(format!("hurentohn-log-{}", std::process::id()));
+        let p = std::env::temp_dir().join(format!("ht-plugin-manager-log-{}", std::process::id()));
         std::fs::File::create(p).unwrap()
     }
 }

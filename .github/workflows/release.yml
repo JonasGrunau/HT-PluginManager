@@ -9,7 +9,7 @@
 # Secrets (the same four as the plugin repos; set them with the audio-plugin
 # skill's set-signing-secrets.sh): MACOS_CERTIFICATES_P12, MACOS_CERTIFICATES_PASSWORD,
 # NOTARY_APPLE_ID, NOTARY_PASSWORD. Without them the DMG is signed ad hoc and not notarized.
-# Optional variable: HURENTOHN_GITHUB_CLIENT_ID overrides the OAuth client ID built into src/config.rs.
+# Optional variable: HTPM_GITHUB_CLIENT_ID overrides the OAuth client ID built into src/config.rs.
 name: Release
 
 on:
@@ -22,7 +22,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: never
-  HURENTOHN_GITHUB_CLIENT_ID: ${{ vars.HURENTOHN_GITHUB_CLIENT_ID }}
+  HTPM_GITHUB_CLIENT_ID: ${{ vars.HTPM_GITHUB_CLIENT_ID }}
 
 jobs:
   version:
@@ -77,21 +77,21 @@ jobs:
             echo "::error::The .p12 has no Developer ID Application identity"; exit 1
           fi
           team=${app##*(}
-          { echo "HURENTOHN_SIGN_IDENTITY=$app"; echo "TEAM_ID=${team%)}"; } >> "$GITHUB_ENV"
+          { echo "HTPM_SIGN_IDENTITY=$app"; echo "TEAM_ID=${team%)}"; } >> "$GITHUB_ENV"
 
       - name: Build, sign and package
         env:
           NOTARY_APPLE_ID: ${{ secrets.NOTARY_APPLE_ID }}
           NOTARY_PASSWORD: ${{ secrets.NOTARY_PASSWORD }}
-          HURENTOHN_OUT: dist
+          HTPM_OUT: dist
         run: |
           if [[ "$SIGN" == true ]]; then
             scripts/bundle.sh --universal --dmg --notarize
           else
             echo "::warning::MACOS_CERTIFICATES_P12 is not set, so the DMG is signed ad hoc and not notarized"
-            HURENTOHN_SIGN_IDENTITY=- scripts/bundle.sh --universal --dmg
+            HTPM_SIGN_IDENTITY=- scripts/bundle.sh --universal --dmg
           fi
-          rm -rf "dist/HurenTohn Plugin Manager.app"
+          rm -rf "dist/HT Plugin Manager.app"
 
       - uses: actions/upload-artifact@v7
         with:
@@ -122,7 +122,7 @@ jobs:
 
       - name: Package
         run: |
-          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$env:VERSION" "/DExe=$PWD\target\release\hurentohn.exe" "/O$PWD\dist" packaging\windows\HurenTohn.iss
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$env:VERSION" "/DExe=$PWD\target\release\ht-plugin-manager.exe" "/O$PWD\dist" packaging\windows\ht-plugin-manager.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - uses: actions/upload-artifact@v7
@@ -149,4 +149,4 @@ jobs:
           flags=()
           [[ "$VERSION" == *-* ]] && flags+=(--prerelease)
           gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
-            --verify-tag --title "HurenTohn Plugin Manager $VERSION" --generate-notes "${flags[@]}"
+            --verify-tag --title "HT Plugin Manager $VERSION" --generate-notes "${flags[@]}"
